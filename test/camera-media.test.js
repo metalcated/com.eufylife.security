@@ -195,6 +195,95 @@ test('same-camera requests share one upstream and become ready only after comple
     assert.equal(h.manager.getStatus('CAMERA_A').state, 'streaming');
 });
 
+test('H264 P2P video keeps its copy path without encoder or resizing work', async (t) => {
+    const h = harness(t);
+    const camera = h.camera();
+    const session = await h.manager.getSession(camera);
+    const { proc } = await h.deliver(camera, transportPackets(), { videoCodec: VideoCodec.H264, videoFPS: 30 });
+    await session.ready.promise;
+    assert.equal(proc.args[proc.args.indexOf('-f') + 1], 'h264');
+    assert.equal(proc.args[proc.args.indexOf('-c:v') + 1], 'copy');
+    assert.equal(proc.args.includes('libx264'), false);
+    assert.equal(proc.args.includes('-vf'), false);
+    assert.equal(proc.args.includes('-profile:v'), false);
+    assert.equal(proc.args.includes('-filter_threads'), false);
+    assert.equal(proc.args.includes('-an'), true);
+    assert.equal(h.manager.getStatus('CAMERA_A').state, 'streaming');
+});
+
+test('H265 P2P video uses bounded browser-compatible H264 encoding and retains stream lifecycle', async (t) => {
+    const h = harness(t);
+    const camera = h.camera();
+    const session = await h.manager.getSession(camera);
+    const { proc, video, audio } = await h.deliver(camera, transportPackets(), { videoCodec: VideoCodec.H265, videoFPS: 60 });
+    await session.ready.promise;
+    const option = (name) => proc.args[proc.args.indexOf(name) + 1];
+    assert.equal(option('-f'), 'hevc');
+    assert.equal(option('-c:v'), 'libx264');
+    assert.equal(proc.args.includes('copy'), false);
+    assert.equal(option('-preset'), 'ultrafast');
+    assert.equal(option('-tune'), 'zerolatency');
+    assert.equal(option('-profile:v'), 'baseline');
+    assert.equal(option('-level:v'), '3.1');
+    assert.equal(option('-pix_fmt'), 'yuv420p');
+    assert.match(option('-vf'), /^fps=15,/);
+    assert.match(option('-vf'), /min\(1280,iw\)/);
+    assert.match(option('-vf'), /min\(720,ih\)/);
+    assert.match(option('-vf'), /force_original_aspect_ratio=decrease/);
+    assert.match(option('-vf'), /force_divisible_by=2/);
+    assert.match(option('-vf'), /setsar=1$/);
+    assert.equal(Number(option('-g')) <= 30, true);
+    assert.equal(option('-g'), option('-keyint_min'));
+    assert.equal(option('-sc_threshold'), '0');
+    assert.match(option('-x264-params'), /(?:^|:)repeat-headers=1(?:$|:)/);
+    assert.equal(option('-filter_threads'), '1');
+    const threadLimits = proc.args.flatMap((arg, index) => arg === '-threads' ? [proc.args[index + 1]] : []);
+    assert.deepEqual(threadLimits, ['1', '1']);
+    assert.equal(option('-maxrate'), '2000k');
+    assert.equal(option('-bufsize'), '4000k');
+    assert.equal(option('-mpegts_flags'), 'resend_headers+pat_pmt_at_frames');
+    assert.equal(h.manager.getStatus('CAMERA_A').state, 'streaming');
+    assert.equal(video.destroyed, false);
+    assert.equal(audio.destroyed, false);
+    await h.manager.stopStream('CAMERA_A');
+    assert.equal(video.destroyed, true);
+    assert.equal(audio.destroyed, true);
+    assert.equal(proc.kills.length > 0, true);
+    assert.equal(h.manager.sessions.size, 0);
+    assert.equal(h.manager.stationOwners.size, 0);
+});
+
+test('H265 encoding preserves lower frame rates and uses the safe default for invalid metadata', async (t) => {
+    for (const [reported, expected] of [[2.5, 2.5], [1, 1], [undefined, 15], [0, 15], [Infinity, 15]]) {
+        await t.test(String(reported), async (subtest) => {
+            const h = harness(subtest);
+            const camera = h.camera();
+            const session = await h.manager.getSession(camera);
+            const { proc } = await h.deliver(camera, transportPackets(), { videoCodec: VideoCodec.H265, videoFPS: reported });
+            await session.ready.promise;
+            assert.match(proc.args[proc.args.indexOf('-vf') + 1], new RegExp(`^fps=${String(expected).replace('.', '\\.')},`));
+            const gop = Number(proc.args[proc.args.indexOf('-g') + 1]);
+            assert.equal(gop >= 1 && gop <= 30, true);
+            assert.equal(gop, Math.max(1, Math.round(expected * 2)));
+        });
+    }
+});
+
+test('native RTSP snapshot sessions retain copy behavior when their source codec is unknown', async (t) => {
+    const h = harness(t);
+    const camera = h.camera('NATIVE_A', 'HOMEBASE_A', { native: true,
+        values: { [PropertyName.DeviceRTSPStreamUrl]: 'rtsp://fixture-camera/live' } });
+    const session = await h.manager.getSession(camera);
+    await flush();
+    const proc = h.processes[0];
+    assert.equal(proc.args.includes('-rtsp_transport'), true);
+    assert.equal(proc.args[proc.args.indexOf('-c:v') + 1], 'copy');
+    assert.equal(proc.args.includes('libx264'), false);
+    assert.equal(proc.args.includes('-vf'), false);
+    proc.stdout.emit('data', transportPackets());
+    await session.ready.promise;
+});
+
 test('unreported camera privacy and a disconnected P2P client cannot start a source', async t => {
     const h = harness(t);
     await assert.rejects(h.manager.getSession(h.camera('UNKNOWN', 'STATION', { values: { enabled: undefined } })), /privacy state/i);

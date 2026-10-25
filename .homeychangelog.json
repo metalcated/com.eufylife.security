@@ -1,4 +1,7 @@
 {
+  "3.44.1": {
+    "en": "Convert HEVC camera streams to bounded H.264 video for browser and Homey WebRTC compatibility."
+  },
   "3.44.0": {
     "en": "Restore on-demand camera streaming through Homey's video proxy, add Video Smart Lock camera media, and isolate snapshots and streams per camera."
   },
