@@ -96,6 +96,8 @@ The adapter merges the global and house-specific Eufy Mega device lists, because
 
 Version 3.43.2 keeps the pairing loading view responsive while display discovery finishes. Completed empty scans stop promptly, and closing or leaving the pairing flow discards late results. Camera and station drivers retain their existing discovery policy. Version 3.43.3 adds failure diagnostics limited to completion flags, a timestamp, safe failure reasons, response types, counts, and fixed protocol field names. Device records, account-provided keys, credentials, and response values are excluded.
 
+Version 3.43.4 handles absent or null cloud collections as empty lists, matching Eufy's SDK. An empty secondary home therefore does not turn a successful display scan into a discovery error. Already paired displays stay excluded from the add-device list.
+
 The [eufy-sdk display research](https://mega-yfue.github.io/smart-display) documents the limited available data; screen brightness, volume, wake, camera-view controls, and firmware installation have no verified command path in the pinned client. These remain managed on the display or in Eufy's app.
 
 ## Validation

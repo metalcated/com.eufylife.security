@@ -167,11 +167,15 @@ test('only existing valid Mega sessions are used and failures preserve legacy di
 
 test('malformed house and device envelopes cannot be mistaken for a complete empty result', async (t) => {
     for (const [name, houses, devices] of [
-        ['missing house envelope', {}, { devices: [] }],
+        ['null house response', null, { devices: [] }],
         ['invalid house collection', { house_infos: 'wrong' }, { devices: [] }],
+        ['non-array house collection', { house_infos: {} }, { devices: [] }],
+        ['false house collection', { house_infos: false }, { devices: [] }],
         ['invalid house identity', { house_infos: [{ house_id: 42 }] }, { devices: [] }],
-        ['missing device envelope', { house_infos: [] }, {}],
-        ['invalid device collection', { house_infos: [] }, { devices: 'wrong' }]
+        ['null device response', { house_infos: [] }, null],
+        ['invalid device collection', { house_infos: [] }, { devices: 'wrong' }],
+        ['non-array device collection', { house_infos: [] }, { devices: {} }],
+        ['zero device collection', { house_infos: [] }, { devices: 0 }]
     ]) {
         await t.test(name, async () => {
             const h = clientDouble({ handler: (endpoint) => endpoint === 'house/get_house_list' ? houses : devices });
@@ -181,6 +185,45 @@ test('malformed house and device envelopes cannot be mistaken for a complete emp
             assert.equal(typeof helper.getStatus(h.client).error, 'string');
         });
     }
+});
+
+test('null or omitted optional collections are complete empty results and clear earlier Mega displays', async (t) => {
+    for (const houses of [{ house_infos: null }, {}]) {
+        for (const devices of [{ devices: null }, {}]) {
+            await t.test(`houses:${Object.hasOwn(houses, 'house_infos') ? 'null' : 'omitted'}, devices:${Object.hasOwn(devices, 'devices') ? 'null' : 'omitted'}`, async () => {
+                let empty = false;
+                const h = clientDouble({ handler: (endpoint) => {
+                    if (endpoint === 'house/get_house_list') return empty ? houses : { house_infos: [] };
+                    return empty ? devices : { devices: [e10('T87A0PREVIOUS')] };
+                } });
+                const helper = discovery();
+                assert.equal((await helper.getDevices(h.client)).length, 1);
+                empty = true;
+                assert.deepEqual(await helper.getDevices(h.client, { refresh: true }), []);
+                assert.equal(helper.getStatus(h.client).complete, true);
+                assert.equal(helper.getStatus(h.client).error, undefined);
+                assert.equal(h.calls.length, 4, 'each attempt queries only account houses and the bare device list');
+            });
+        }
+    }
+});
+
+test('a mixed account inventory and populated house retain the E10 when another house reports devices null', async () => {
+    const accountRecords = Array.from({ length: 16 }, (_, index) => ({
+        device_sn: `T8416CAMERA${index}`, device_model: 'T8416', device_type: 1, device_name: `Camera ${index}`
+    }));
+    const h = clientDouble({ handler: (endpoint, query) => {
+        if (endpoint === 'house/get_house_list') return { house_infos: [{ house_id: 'POPULATED' }, { house_id: 'EMPTY' }] };
+        if (query.house_id === 'POPULATED') return { devices: [e10('T87A0HOUSE-DISPLAY')] };
+        if (query.house_id === 'EMPTY') return { devices: null };
+        return { devices: accountRecords };
+    } });
+    const helper = discovery();
+    const found = await helper.getDevices(h.client);
+    assert.deepEqual(found.map((device) => device.getSerial()), ['T87A0HOUSE-DISPLAY']);
+    assert.equal(helper.getStatus(h.client).complete, true);
+    assert.equal(helper.getStatus(h.client).error, undefined);
+    assert.equal(h.calls.length, 4);
 });
 
 test('concurrent display discovery coalesces requests and honors TTL and explicit refresh', async () => {
@@ -293,7 +336,7 @@ test('discovery failure reasons describe the failing stage without exposing back
         ['session_suppressed', (h) => { h.client.megaTransition.megaLoginFailed = true; }],
         ['unsupported_client', (h) => { delete h.client.megaTransition.megaApi.callDecrypted; }],
         ['session_invalid', (h) => { h.client.megaTransition.megaApi.hasValidSession = () => false; }],
-        ['unexpected_response', (h) => { h.client.megaTransition.megaApi.callDecrypted = async () => ({ body: secret }); }],
+        ['unexpected_response', (h) => { h.client.megaTransition.megaApi.callDecrypted = async () => ({ house_infos: secret, devices: secret }); }],
         ['request_failed', (h) => { h.client.megaTransition.megaApi.callDecrypted = async () => { throw Error(secret); }; }],
         ['legacy_unavailable', (h) => { h.client.getDevices = async () => { throw Error(secret); }; }]
     ];

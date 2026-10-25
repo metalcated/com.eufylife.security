@@ -1,4 +1,7 @@
 {
+  "3.43.4": {
+    "en": "Treat empty Eufy home collections as empty lists so an unused home does not fail smart-display discovery."
+  },
   "3.43.3": {
     "en": "Report safe response structure when smart-display cloud discovery is incomplete."
   },
