@@ -1,0 +1,450 @@
+'use strict';
+
+// Homey's settings bridge supplies authentication. Keys, media URLs, and SDP
+// stay out of the DOM, browser storage, and logs.
+(() => {
+  const KEEPALIVE_MS = 20000;
+  const ICE_TIMEOUT_MS = 12000;
+  const CONNECT_TIMEOUT_MS = 60000;
+  const state = { homey: null, cameras: new Map(), selected: new Set(), tiles: new Map(), views: new Map(),
+    configured: false, maxViews: 4, selectionInitialized: false, loading: false, catalogGeneration: 0,
+    modalOpen: false, saving: false, previousFocus: null, disposed: false, selectionWrites: Promise.resolve() };
+  const $ = (id) => document.getElementById(id);
+
+  function api(method, route, body, timeout = 30000, onLateResult = null) {
+    return new Promise((resolve, reject) => {
+      let settled = false, timedOut = false;
+      const finish = (error, result) => {
+        if (settled) {
+          if (timedOut && !error && onLateResult) { onLateResult(result); onLateResult = null; }
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        if (error) reject(error); else resolve(result);
+      };
+      const timer = setTimeout(() => { timedOut = true; finish({ code: 'TIMEOUT' }); }, timeout);
+      try { state.homey.api(method, route, body, finish); }
+      catch (error) { finish(error); }
+    });
+  }
+
+  function message(text = '', tone = 'info') {
+    const notice = $('page-message');
+    notice.textContent = text;
+    notice.dataset.tone = tone;
+    notice.hidden = !text;
+  }
+
+  function safeError(error, purpose) {
+    const detail = `${error?.code || ''} ${error?.statusCode || ''} ${error?.message || ''}`.toLowerCase();
+    if (/busy|homebase|maximum|limit/.test(detail)) return 'This camera or its HomeBase is busy. Stop another feed, then retry.';
+    if (/privacy|disabled/.test(detail)) return 'This camera is in privacy mode or disabled. Enable it in Eufy, then retry.';
+    if (/401|403|permission|forbidden|unauthori|connect a read-only|check its api key|not.?configured/.test(detail)) return 'Check the saved API key and its device read access in Camera wall setup.';
+    if (purpose === 'configure') return 'The key could not be saved. Check its device read access, then try again.';
+    if (/unavailable|offline|not.?ready/.test(detail)) return 'The camera is unavailable. Check its connection and refresh cameras.';
+    if (purpose === 'catalog') return 'Your cameras could not be loaded. Check the Homey connection, then select Refresh cameras.';
+    return 'The camera could not connect. Check its connection, then select Retry.';
+  }
+
+  function current(view) { return !state.disposed && state.views.get(view.id) === view; }
+  function canPlay(camera) { return camera?.available && camera?.videoRegistered; }
+  function route(id, action) { return `/camera-wall/${encodeURIComponent(id)}/${action}`; }
+
+  function settingsCall(method, ...args) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (error, result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (error) reject(error); else resolve(result);
+      };
+      const timer = setTimeout(() => finish({ code: 'TIMEOUT' }), 5000);
+      try { state.homey[method](...args, finish); }
+      catch (error) { finish(error); }
+    });
+  }
+
+  function saveSelection() {
+    const ids = [...state.selected].filter((id) => state.cameras.has(id)).slice(0, state.maxViews);
+    // Serialize preference writes so an earlier choice cannot overwrite a later one.
+    state.selectionWrites = state.selectionWrites.catch(() => {}).then(() => settingsCall('set', 'camera_wall_selection', ids)).catch(() => {
+      if (!state.disposed) message('Camera choices could not be saved. They will be kept for this visit.');
+    });
+  }
+
+  async function restoreSelection() {
+    try {
+      const ids = await settingsCall('get', 'camera_wall_selection');
+      if (state.disposed || !Array.isArray(ids)) return;
+      state.selected = new Set(ids.filter((id) => typeof id === 'string' && id).slice(0, 4));
+      state.selectionInitialized = true;
+    } catch (_) { /* Cameras still load if the saved preference is unavailable. */ }
+  }
+
+  function setTile(id, phase, text) {
+    const tile = state.tiles.get(id);
+    if (!tile) return;
+    const camera = state.cameras.get(id);
+    tile.dataset.state = phase;
+    tile.querySelector('.camera-status').textContent = text;
+    tile.querySelector('.live-label').hidden = phase !== 'live';
+    tile.querySelector('.placeholder-label').textContent = phase === 'connecting' ? 'Connecting to your camera…' : phase === 'error' ? 'Camera needs attention' : 'Ready when you are';
+    const button = tile.querySelector('.feed-toggle');
+    button.textContent = phase === 'connecting' || phase === 'live' ? 'Stop' : phase === 'error' ? 'Retry' : 'Play';
+    button.disabled = !(phase === 'connecting' || phase === 'live') && (!state.configured || !canPlay(camera) || state.disposed);
+    updateControls();
+  }
+
+  function stoppedText(camera) {
+    if (!camera.available) return 'Unavailable in Homey. Check the camera connection.';
+    if (!camera.videoRegistered) return 'Video is not ready. Refresh cameras to check again.';
+    if (!state.configured) return 'Set up the camera wall to play this feed.';
+    return 'Select Play to connect.';
+  }
+
+  function updateControls() {
+    const playable = [...state.selected].some((id) => canPlay(state.cameras.get(id)) && !state.views.has(id));
+    $('play-selected').disabled = !state.configured || !playable || state.disposed;
+    $('stop-all').disabled = state.views.size === 0;
+    $('refresh-button').disabled = state.loading;
+    $('selection-count').textContent = `${state.selected.size} of ${state.maxViews} selected`;
+    $('setup-notice').hidden = state.configured;
+    for (const input of $('camera-options').querySelectorAll('input')) input.disabled = !input.checked && state.selected.size >= state.maxViews;
+  }
+
+  function createTile(camera) {
+    const tile = $('camera-tile-template').content.firstElementChild.cloneNode(true);
+    tile.dataset.cameraId = camera.id;
+    tile.querySelector('.camera-name').textContent = camera.name;
+    const video = tile.querySelector('video');
+    video.muted = true;
+    tile.querySelector('.feed-toggle').addEventListener('click', () => {
+      if (state.views.has(camera.id)) stopView(camera.id);
+      else startView(camera.id);
+    });
+    video.addEventListener('playing', () => {
+      const view = state.views.get(camera.id);
+      if (!view || view.video !== video) return;
+      clearTimeout(view.connectTimer);
+      setTile(camera.id, 'live', 'Live video · Sound off');
+    });
+    const fullscreen = tile.querySelector('.feed-fullscreen');
+    fullscreen.hidden = !tile.requestFullscreen;
+    fullscreen.setAttribute('aria-label', `Show ${camera.name} fullscreen`);
+    fullscreen.addEventListener('click', () => showFullscreen(tile));
+    state.tiles.set(camera.id, tile);
+    return tile;
+  }
+
+  function renderCameras() {
+    const options = $('camera-options');
+    options.replaceChildren();
+    for (const camera of state.cameras.values()) {
+      const label = document.createElement('label');
+      label.className = 'camera-option';
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.value = camera.id;
+      input.checked = state.selected.has(camera.id);
+      input.addEventListener('change', () => {
+        if (input.checked && state.selected.size < state.maxViews) state.selected.add(camera.id);
+        else { input.checked = false; state.selected.delete(camera.id); stopView(camera.id); }
+        renderGrid();
+        saveSelection();
+      });
+      const name = document.createElement('span');
+      name.textContent = camera.name;
+      label.append(input, name);
+      if (!canPlay(camera)) {
+        const unavailable = document.createElement('span');
+        unavailable.className = 'option-unavailable';
+        unavailable.textContent = camera.available ? 'Video not ready' : 'Unavailable';
+        label.append(unavailable);
+      }
+      options.append(label);
+    }
+    renderGrid();
+  }
+
+  function renderGrid() {
+    const grid = $('camera-grid');
+    for (const [id, tile] of state.tiles) {
+      if (!state.selected.has(id) || !state.cameras.has(id)) { tile.remove(); state.tiles.delete(id); }
+    }
+    for (const id of state.selected) {
+      const camera = state.cameras.get(id);
+      if (!camera) continue;
+      const tile = state.tiles.get(id) || createTile(camera);
+      tile.querySelector('.camera-name').textContent = camera.name;
+      grid.append(tile);
+      if (!state.views.has(id)) setTile(id, 'stopped', stoppedText(camera));
+    }
+    grid.dataset.count = String(state.selected.size);
+    $('empty-state').hidden = state.selected.size !== 0;
+    updateControls();
+  }
+
+  async function loadCameras() {
+    const generation = ++state.catalogGeneration;
+    state.loading = true;
+    updateControls();
+    try {
+      const result = await api('GET', '/camera-wall', null);
+      if (state.disposed || generation !== state.catalogGeneration) return;
+      if (!result || !Array.isArray(result.cameras) || typeof result.configured !== 'boolean') throw Error('Invalid inventory');
+      state.configured = result.configured;
+      state.maxViews = Number.isInteger(result.maxViews) ? Math.max(1, Math.min(4, result.maxViews)) : 4;
+      const cameras = new Map();
+      for (const item of result.cameras) if (item && typeof item.id === 'string' && item.id && !cameras.has(item.id)) {
+        cameras.set(item.id, { id: item.id, name: typeof item.name === 'string' && item.name ? item.name : 'Camera',
+          available: item.available === true, videoRegistered: item.videoRegistered === true });
+      }
+      state.cameras = cameras;
+      for (const id of state.selected) if (!cameras.has(id)) { state.selected.delete(id); stopView(id); }
+      for (const [id] of state.views) if (!state.configured || !canPlay(cameras.get(id))) stopView(id);
+      if (!state.selectionInitialized) {
+        const candidates = [...cameras.values()].sort((a, b) => Number(canPlay(b)) - Number(canPlay(a)));
+        candidates.slice(0, state.maxViews).forEach((camera) => state.selected.add(camera.id));
+        state.selectionInitialized = true;
+      }
+      while (state.selected.size > state.maxViews) { const id = [...state.selected].pop(); state.selected.delete(id); stopView(id); }
+      const available = [...cameras.values()].filter(canPlay).length;
+      $('inventory-status').textContent = cameras.size ? `${available} of ${cameras.size} cameras ready for live view` : 'No cameras are ready for this wall yet';
+      message(cameras.size ? '' : 'Pair a camera with Eufy Security in Homey, then refresh this page.');
+      renderCameras();
+      return true;
+    } catch (error) {
+      if (!state.disposed && generation === state.catalogGeneration) {
+        $('inventory-status').textContent = 'Camera list unavailable';
+        message(safeError(error, 'catalog'), 'error');
+      }
+      return false;
+    } finally {
+      if (generation === state.catalogGeneration) { state.loading = false; updateControls(); }
+    }
+  }
+
+  function waitForIce(view) {
+    return new Promise((resolve, reject) => {
+      const pc = view.pc;
+      let settled = false;
+      const finish = (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        pc.removeEventListener('icegatheringstatechange', changed);
+        view.cancelIce = null;
+        if (error) reject(error); else resolve();
+      };
+      const changed = () => { if (pc.iceGatheringState === 'complete') finish(); };
+      const timer = setTimeout(() => finish({ code: 'ICE_TIMEOUT' }), ICE_TIMEOUT_MS);
+      view.cancelIce = () => finish({ code: 'CANCELLED' });
+      pc.addEventListener('icegatheringstatechange', changed);
+      changed();
+    });
+  }
+
+  function stopRemote(id, handle) { return api('POST', route(id, 'stop'), { handle }, 10000).catch(() => {}); }
+
+  function stopView(id, options = {}) {
+    const view = state.views.get(id);
+    if (view) {
+      state.views.delete(id);
+      clearTimeout(view.keepaliveTimer);
+      clearTimeout(view.connectTimer);
+      clearTimeout(view.disconnectTimer);
+      view.cancelIce?.();
+      view.pc.ontrack = null;
+      view.pc.onconnectionstatechange = null;
+      view.pc.close();
+      for (const track of view.stream.getTracks()) track.stop();
+      view.video.pause();
+      view.video.srcObject = null;
+      if (view.handle) stopRemote(id, view.handle);
+    }
+    const camera = state.cameras.get(id);
+    if (camera) setTile(id, options.phase || 'stopped', options.message || stoppedText(camera));
+    updateControls();
+  }
+
+  function stopAll(options) { for (const id of [...state.views.keys()]) stopView(id, options); }
+
+  function failView(view, text) {
+    if (current(view)) stopView(view.id, { phase: 'error', message: text });
+  }
+
+  function scheduleKeepalive(view) {
+    if (!current(view)) return;
+    view.keepaliveTimer = setTimeout(async () => {
+      if (!current(view)) return;
+      try {
+        await api('POST', route(view.id, 'keepalive'), { handle: view.handle }, 12000);
+        if (current(view)) scheduleKeepalive(view);
+      } catch (error) { failView(view, safeError(error, 'keepalive')); }
+    }, KEEPALIVE_MS);
+  }
+
+  async function startView(id) {
+    const camera = state.cameras.get(id);
+    if (state.disposed || state.views.has(id) || !state.selected.has(id) || !canPlay(camera)) return;
+    if (!state.configured) { openSetup(); return; }
+    if (!window.RTCPeerConnection || !window.MediaStream) {
+      setTile(id, 'error', 'This browser does not support live camera video. Open the wall in a current browser.');
+      return;
+    }
+    let view;
+    try {
+      const pc = new RTCPeerConnection();
+      const video = state.tiles.get(id).querySelector('video');
+      view = { id, pc, video, stream: new MediaStream(), handle: null };
+      state.views.set(id, view);
+      video.srcObject = view.stream;
+      video.muted = true;
+      // Muted playback begins from this user gesture; retry when the first track arrives.
+      video.play().catch(() => {});
+      setTile(id, 'connecting', 'Connecting to the camera…');
+      view.connectTimer = setTimeout(() => failView(view, 'The camera took too long to provide video. Select Retry to reconnect.'), CONNECT_TIMEOUT_MS);
+      pc.ontrack = (event) => {
+        if (!current(view)) return;
+        if (!view.stream.getTracks().some((track) => track.id === event.track.id)) view.stream.addTrack(event.track);
+        event.track.addEventListener('ended', () => failView(view, 'The camera feed ended. Select Retry to reconnect.'), { once: true });
+        video.play().catch(() => failView(view, 'Playback was blocked by this browser. Select Retry to start the feed.'));
+      };
+      pc.onconnectionstatechange = () => {
+        if (!current(view)) return;
+        if (pc.connectionState === 'failed' || pc.connectionState === 'closed') failView(view, 'The camera connection ended. Select Retry to reconnect.');
+        else if (pc.connectionState === 'disconnected') {
+          clearTimeout(view.disconnectTimer);
+          view.disconnectTimer = setTimeout(() => failView(view, 'The camera connection was interrupted. Select Retry to reconnect.'), 8000);
+        } else clearTimeout(view.disconnectTimer);
+      };
+      pc.addTransceiver('video', { direction: 'recvonly' });
+      pc.addTransceiver('audio', { direction: 'recvonly' });
+      await pc.setLocalDescription(await pc.createOffer());
+      if (!current(view)) return;
+      await waitForIce(view);
+      if (!current(view)) return;
+      const offerSdp = pc.localDescription?.sdp;
+      if (typeof offerSdp !== 'string' || !offerSdp) throw Error('Missing offer');
+      const result = await api('POST', route(id, 'offer'), { offerSdp }, 40000, (late) => {
+        if (typeof late?.handle === 'string' && late.handle) stopRemote(id, late.handle);
+      });
+      const handle = typeof result?.handle === 'string' && result.handle ? result.handle : null;
+      if (!current(view)) { if (handle) stopRemote(id, handle); return; }
+      view.handle = handle;
+      if (!handle || typeof result.answerSdp !== 'string' || !result.answerSdp) throw Error('Invalid answer');
+      // Match Homey's browser player: its camera answer must send to recvonly transceivers.
+      await pc.setRemoteDescription({ type: 'answer', sdp: result.answerSdp.replace(/^a=sendrecv(?=\r?$)/gm, 'a=sendonly') });
+      if (!current(view)) return;
+      scheduleKeepalive(view);
+    } catch (error) {
+      if (view) failView(view, safeError(error, 'offer'));
+      else setTile(id, 'error', safeError(error, 'offer'));
+    }
+  }
+
+  async function showFullscreen(element) {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else await element.requestFullscreen();
+    } catch (_) { message('Fullscreen is not available in this Homey window. You can keep watching here.'); }
+  }
+
+  function openSetup() {
+    if (state.modalOpen || state.disposed) return;
+    state.previousFocus = document.activeElement;
+    state.modalOpen = true;
+    $('api-key').value = '';
+    $('setup-error').hidden = true;
+    $('setup-error').textContent = '';
+    $('setup-modal').hidden = false;
+    $('camera-wall').inert = true;
+    document.body.classList.add('modal-open');
+    $('api-key').focus();
+  }
+
+  function closeSetup() {
+    if (state.saving) return;
+    state.modalOpen = false;
+    $('api-key').value = '';
+    $('setup-modal').hidden = true;
+    $('camera-wall').inert = false;
+    document.body.classList.remove('modal-open');
+    state.previousFocus?.focus();
+  }
+
+  async function saveSetup(event) {
+    event.preventDefault();
+    if (state.saving) return;
+    let key = $('api-key').value.trim();
+    if (!key) { $('api-key').focus(); return; }
+    state.saving = true;
+    $('setup-error').hidden = true;
+    $('save-setup').textContent = 'Saving…';
+    for (const id of ['save-setup', 'cancel-setup', 'close-setup', 'api-key']) $(id).disabled = true;
+    try {
+      const pending = api('POST', '/camera-wall/configure', { key });
+      key = '';
+      $('api-key').value = '';
+      const result = await pending;
+      if (result?.configured !== true) throw Error('Configuration unavailable');
+      state.configured = true;
+      stopAll();
+      state.saving = false;
+      closeSetup();
+      const loaded = await loadCameras();
+      if (loaded && !state.disposed) message('Camera wall connected. Choose your cameras and select Play selected.');
+    } catch (error) {
+      if (!state.disposed) {
+        $('setup-error').textContent = safeError(error, 'configure');
+        $('setup-error').hidden = false;
+      }
+    } finally {
+      key = '';
+      state.saving = false;
+      $('save-setup').textContent = 'Save key';
+      for (const id of ['save-setup', 'cancel-setup', 'close-setup', 'api-key']) $(id).disabled = false;
+      updateControls();
+      if (state.modalOpen) $('api-key').focus();
+    }
+  }
+
+  function handleModalKeys(event) {
+    if (!state.modalOpen) return;
+    if (event.key === 'Escape') { event.preventDefault(); closeSetup(); }
+    if (event.key !== 'Tab') return;
+    const focusable = [...$('setup-modal').querySelectorAll('button:not(:disabled), input:not(:disabled), [tabindex="0"]')];
+    if (!focusable.length) { event.preventDefault(); return; }
+    const first = focusable[0], last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+  }
+
+  window.onHomeyReady = (Homey) => {
+    if (state.homey) return;
+    state.homey = Homey;
+    $('setup-button').addEventListener('click', openSetup);
+    $('connect-button').addEventListener('click', openSetup);
+    $('close-setup').addEventListener('click', closeSetup);
+    $('cancel-setup').addEventListener('click', closeSetup);
+    $('setup-form').addEventListener('submit', saveSetup);
+    $('refresh-button').addEventListener('click', loadCameras);
+    $('play-selected').addEventListener('click', () => { message(); for (const id of state.selected) startView(id); });
+    $('stop-all').addEventListener('click', () => stopAll());
+    $('wall-fullscreen').hidden = !$('camera-grid').requestFullscreen;
+    $('wall-fullscreen').addEventListener('click', () => showFullscreen($('camera-grid')));
+    document.addEventListener('keydown', handleModalKeys);
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden && state.views.size) { stopAll(); message('Feeds paused while this page was in the background. Select Play selected to resume.'); }
+    });
+    window.addEventListener('pagehide', (event) => {
+      stopAll();
+      $('api-key').value = '';
+      if (!event.persisted) { state.disposed = true; ++state.catalogGeneration; }
+    });
+    Homey.ready();
+    restoreSelection().then(() => { if (!state.disposed) loadCameras(); });
+  };
+})();

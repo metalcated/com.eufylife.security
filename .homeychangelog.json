@@ -1,4 +1,7 @@
 {
+  "3.44.0": {
+    "en": "Restore on-demand camera streaming through Homey's video proxy, add Video Smart Lock camera media, and isolate snapshots and streams per camera."
+  },
   "3.43.4": {
     "en": "Treat empty Eufy home collections as empty lists so an unused home does not fail smart-display discovery."
   },

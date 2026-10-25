@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "eufy-security-client": "github:martijnpoppen/eufy-security-client#homey-integration",
-    "fluent-ffmpeg": "^2.1.3"
+    "fluent-ffmpeg": "^2.1.3",
+    "homey-api": "3.21.0"
   }
 }

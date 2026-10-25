@@ -8,7 +8,9 @@ Bluetooth locks require a compatible Eufy Wi-Fi bridge configured in the Eufy ap
 
 The driver groups the Bluetooth/bridge, Wi-Fi, and advanced Wi-Fi lock families that the bundled Eufy client can control, including its supported R10/R20 variants. A lock is offered only when the client supports its lock/unlock command and reports a writable lock state. Recognition of a model name alone does not establish support for a newer lock.
 
-This includes S230/T8510P and Video Smart Lock S330/T8530. The latter requires its Wi-Fi bridge or compatible HomeBase. Video models expose lock control and battery properties in this driver; camera streams, snapshots, motion, and doorbell events are not included. Manual/external state updates on video and FamiLock models require live validation because of gaps in the pinned client's MQTT handling.
+This includes S230/T8510P and Video Smart Lock S330/T8530. The latter requires its Wi-Fi bridge or compatible HomeBase. Locks that advertise a livestream command in the Eufy client also expose camera snapshots and, on supported Homey platforms, live video. The device keeps its lock tile, state, and lock/unlock controls. An ordinary lock does not acquire camera controls because its model name resembles a video lock.
+
+For a video lock, open its camera in Homey or use the **Take snapshot** Flow action. Camera initialization failures leave valid lock control available. A HomeBase can provide one P2P camera feed at a time; stop an existing feed before opening another camera or requesting its snapshot. Manual/external lock-state updates on video and FamiLock models require live validation because of gaps in the pinned client's MQTT handling.
 
 C30 (T85D0) and Video Smart Lock E330 (T8531) are currently excluded because the bundled client does not implement their lock/unlock commands. This driver does not manage PIN codes, fingerprints, access schedules, or lock users.
 

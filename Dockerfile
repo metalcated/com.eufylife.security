@@ -19,7 +19,8 @@ FROM dependencies AS verified
 COPY . .
 RUN npm test \
     && homey app validate --level debug \
-    && homey app build
+    && homey app build \
+    && node scripts/check-media.cjs
 
 FROM verified AS installer
 RUN node scripts/check-package.cjs

@@ -12,7 +12,7 @@ const flowConditions = require('./lib/flow/conditions.js');
 const flowTriggers = require('./lib/flow/triggers.js');
 
 const eufyEventsHelper = require('./lib/helpers/eufy-events.helper');
-const FfmpegManager = require('./lib/helpers/eufy-stream.helper');
+const FfmpegManager = require('./lib/helpers/camera-media.helper');
 
 const { sleep, randomNumber, normalizeRemoteLines, fetchRemoteText } = require('./lib/utils');
 
@@ -311,9 +311,10 @@ class App extends Homey.App {
             flowConditions.init(this.homey);
             flowTriggers.init(this.homey);
 
-            this.FfmpegManager = new FfmpegManager(this.homey);
-            this.eufyEventsHelper = new eufyEventsHelper(this.homey);
         }
+        if (!this.FfmpegManager) this.FfmpegManager = new FfmpegManager(this.homey);
+        if (!this.eufyEventsHelper) this.eufyEventsHelper = new eufyEventsHelper(this.homey);
+        else this.eufyEventsHelper.init();
     }
 
     // -------------------- EUFY LOGIN ----------------------
@@ -459,6 +460,8 @@ class App extends Homey.App {
     }
 
     async resetEufyClient() {
+        this.eufyEventsHelper?.dispose();
+        await this.FfmpegManager?.reset();
         if (this.eufyClient) {
             this.warn('resetEufyClient - Resetting EufyClient');
             this.eufyClient.close();
@@ -468,6 +471,7 @@ class App extends Homey.App {
 
         if (this.deviceList) {
             this.deviceList.forEach((device) => {
+                device._started = false;
                 device.setUnavailable(`${device.getName()} ${this.homey.__('device.init')}`);
             });
         }
@@ -562,9 +566,17 @@ class App extends Homey.App {
             });
 
             this.deviceList = filteredList;
+            await this.eufyEventsHelper?.setDevices(this.deviceList);
         } catch (error) {
             this.error(error);
         }
+    }
+
+    async onUninit() {
+        this.eufyEventsHelper?.dispose();
+        await this.cameraWall?.dispose?.();
+        await this.FfmpegManager?.dispose();
+        this.eufyClient?.close?.();
     }
 
     async copyUserdataFile(file) {

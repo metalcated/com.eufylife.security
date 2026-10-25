@@ -1,7 +1,7 @@
 'use strict';
 
 const mainSensor = require('./main-sensor');
-const { DeviceType, PropertyName } = require('eufy-security-client');
+const { CommandName, DeviceType, PropertyName } = require('eufy-security-client');
 const { isSupportedLock } = require('../lib/lock-support');
 
 const properties = new Map([
@@ -54,6 +54,7 @@ module.exports = class mainLock extends mainSensor {
             if (!client.isConnected()) throw new Error('Connection to Eufy was lost during lock startup.');
             this._started = true;
             await step(() => this.setAvailable());
+            await this.initializeLockMedia(step, active);
         } catch (error) {
             if (!active()) return;
             this._started = false;
@@ -71,6 +72,7 @@ module.exports = class mainLock extends mainSensor {
             this.cancelLockCommand(new Error('Connection to Eufy was lost. Please reconnect and retry.'));
             this.setUnavailable('Connection to Eufy was lost.').catch((error) => this.homey.app.error(error));
             this.setCapabilityValue('locked', null).catch((error) => this.homey.app.error(error));
+            this.cleanupLockMedia(false);
         };
         const onProperty = (device, name, value) => {
             if (this._lockNeedsState && device.getSerial() === this.HomeyDevice.device_sn &&
@@ -100,12 +102,47 @@ module.exports = class mainLock extends mainSensor {
         const desired = [...properties]
             .filter(([property]) => this.EufyDevice.hasProperty(property))
             .map(([, capability]) => capability);
+        if (this.hasLockCamera()) desired.push('CMD_SNAPSHOT', 'CMD_START_STREAM');
 
         for (const capability of this.getCapabilities()) {
             if (!desired.includes(capability)) await this.removeCapability(capability);
         }
         for (const capability of desired) {
             if (!this.hasCapability(capability)) await this.addCapability(capability);
+        }
+    }
+
+    hasLockCamera() {
+        return typeof this.EufyDevice?.hasCommand === 'function' &&
+            this.EufyDevice.hasCommand(CommandName.DeviceStartLivestream);
+    }
+
+    async initializeLockMedia(step, active) {
+        if (!this.hasLockCamera()) return;
+        const operations = [() => this.setImage('snapshot'), () => this.setImage('event')];
+        if (this.homey.platformVersion === 2) operations.push(() => this.setVideo());
+        for (const operation of operations) {
+            try {
+                await step(operation);
+            } catch (error) {
+                if (!active()) {
+                    if (this._lockDisposed) await this.cleanupLockMedia(true);
+                    return;
+                }
+                this.homey.app.warn(`[Device] ${this.getName()} - Camera media could not be initialized. Lock control remains available.`);
+            }
+        }
+    }
+
+    async cleanupLockMedia(release) {
+        if (!this.hasLockCamera()) return;
+        const manager = this.homey.app.FfmpegManager;
+        const method = release ? 'releaseDevice' : 'stopStream';
+        if (typeof manager?.[method] !== 'function') return;
+        try {
+            await manager[method](this.HomeyDevice.device_sn);
+        } catch (error) {
+            this.homey.app.warn(`[Device] ${this.getName()} - Camera media cleanup failed.`);
         }
     }
 
@@ -213,15 +250,17 @@ module.exports = class mainLock extends mainSensor {
         this._lockNeedsState = false;
         this.cancelLockCommand(new Error('The lock device is shutting down.'));
         this.cleanupLockConnectionListeners();
+        await this.cleanupLockMedia(true);
     }
 
-    onDeleted() {
+    async onDeleted() {
         this._lockDisposed = true;
         this._lockStartupToken = (this._lockStartupToken || 0) + 1;
         this._started = false;
         this._lockNeedsState = false;
         this.cancelLockCommand(new Error('The lock was removed from Homey.'));
         this.cleanupLockConnectionListeners();
+        await this.cleanupLockMedia(true);
         super.onDeleted();
     }
 };

@@ -1,6 +1,18 @@
 {
   "id": "com.eufylife.security",
-  "version": "3.43.4",
+  "version": "3.44.0",
+  "api": {
+    "getCameraStatus": {
+      "method": "GET",
+      "path": "/cameras/status",
+      "public": false
+    },
+    "getCameraWall": { "method": "GET", "path": "/camera-wall", "public": false },
+    "configureCameraWall": { "method": "POST", "path": "/camera-wall/configure", "public": false },
+    "offerCameraWall": { "method": "POST", "path": "/camera-wall/:id/offer", "public": false },
+    "keepAliveCameraWall": { "method": "POST", "path": "/camera-wall/:id/keepalive", "public": false },
+    "stopCameraWall": { "method": "POST", "path": "/camera-wall/:id/stop", "public": false }
+  },
   "compatibility": ">=5.0.0",
   "sdk": 3,
   "brandColor": "#2a6185",

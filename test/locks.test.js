@@ -54,6 +54,7 @@ const DeviceType = {
     LOCK_85V0: 203,
     LOCK_85P0: 209
 };
+const CommandName = Object.freeze({ DeviceStartLivestream: 'deviceStartLivestream' });
 
 // Load the real integration with only the unavailable Homey/client runtimes replaced.
 // Every test gets isolated modules and deterministic timers; no account is contacted.
@@ -62,7 +63,7 @@ function loadIntegration() {
     const utils = { ...require('../lib/utils'), sleep: async () => {} };
     const mocks = {
         homey: { Device: class {}, Driver: class {} },
-        'eufy-security-client': { PropertyName, DeviceType, AlarmEvent: {} }
+        'eufy-security-client': { CommandName, PropertyName, DeviceType, AlarmEvent: {} }
     };
 
     function load(filename) {
@@ -86,7 +87,7 @@ function loadIntegration() {
     return { load };
 }
 
-function eufyDevice({ serial = 'T8520TEST0001', type = 51, channel = 1, properties, writeable = true, lock = true } = {}) {
+function eufyDevice({ serial = 'T8520TEST0001', type = 51, channel = 1, properties, writeable = true, lock = true, commands = [] } = {}) {
     const values = properties || {
         [PropertyName.DeviceLocked]: true,
         [PropertyName.DeviceBattery]: 42,
@@ -100,6 +101,7 @@ function eufyDevice({ serial = 'T8520TEST0001', type = 51, channel = 1, properti
         getDeviceType: () => type,
         getChannel: () => channel,
         isLock: () => lock,
+        hasCommand: (name) => commands.includes(name),
         hasBattery: () => Object.hasOwn(values, PropertyName.DeviceBattery),
         hasProperty: (name) => Object.hasOwn(values, name),
         getPropertyValue: (name) => values[name],
@@ -126,13 +128,20 @@ function harness(options = {}) {
     const values = new Map([['locked', null]]);
     const listeners = new Map();
     const calls = [];
+    const mediaCalls = [];
     const log = () => {};
     const homey = {
         platformVersion: 2,
         __: (key) => key,
         setTimeout: (fn, delay) => { const id = ++timerID; timers.set(id, { fn, delay }); return id; },
         clearTimeout: (id) => timers.delete(id),
-        app: { log, debug: log, warn: log, error: log, eufyClient: client, deviceList: [device], setDevice: log }
+        app: {
+            log, debug: log, warn: log, error: log, eufyClient: client, deviceList: [device], setDevice: log,
+            FfmpegManager: {
+                stopStream: async (...args) => mediaCalls.push(['stop', ...args]),
+                releaseDevice: async (...args) => mediaCalls.push(['release', ...args])
+            }
+        }
     };
     Object.assign(device, {
         homey,
@@ -168,7 +177,17 @@ function harness(options = {}) {
     client.setDeviceProperty = async (...args) => calls.push(['command', ...args]);
     const events = new Events(homey);
     homey.app.eufyEventsHelper = events;
-    return { ...modules, device, remote, station, client, homey, events, values, listeners, calls, timers };
+    const sharedCloseListeners = client.listeners('close');
+    assert.equal(sharedCloseListeners.length, 1, 'the app-wide media helper owns one close listener');
+    return { ...modules, device, remote, station, client, homey, events, values, listeners, calls, timers, mediaCalls, sharedCloseListeners };
+}
+
+function deviceCloseListenerCount(h) {
+    const listeners = h.client.listeners('close');
+    for (const shared of h.sharedCloseListeners) {
+        assert.ok(listeners.includes(shared), 'device lifecycle cleanup must preserve the app-wide media close listener');
+    }
+    return listeners.filter((listener) => !h.sharedCloseListeners.includes(listener)).length;
 }
 
 async function flush() {
@@ -244,6 +263,158 @@ test('lock startup uses sensor paths and exposes only reported capabilities', as
     assert.equal(h.calls.some(([name]) => name === 'command'), false);
 });
 
+test('video locks expose camera media from advertised commands while retaining native lock control', async () => {
+    const h = harness({ type: 55, serial: 'T8530VIDEO', commands: [CommandName.DeviceStartLivestream] });
+    h.device.setImage = async (type) => h.calls.push(['image', type]);
+    h.device.setVideo = async () => h.calls.push(['video']);
+    await h.device.onStartup();
+    assert.equal(h.device._started, true);
+    assert.deepEqual(h.device.getCapabilities().sort(), ['CMD_SNAPSHOT', 'CMD_START_STREAM', 'alarm_battery', 'locked', 'measure_battery']);
+    assert.deepEqual(h.calls.filter(([name]) => name === 'image' || name === 'video'), [['image', 'snapshot'], ['image', 'event'], ['video']]);
+    assert.deepEqual([...h.listeners.keys()], ['locked'], 'camera registration must not install a camera power or arming listener');
+    assert.equal(h.device.driver.manifest.capabilities.includes('locked'), true);
+    const command = h.listeners.get('locked')(false);
+    await flush();
+    h.client.emit('device property changed', h.remote, PropertyName.DeviceLocked, false);
+    await command;
+    assert.equal(h.values.get('locked'), false);
+});
+
+test('a video model without the client livestream command does not acquire camera controls', async () => {
+    const h = harness({ type: 55, serial: 'T8530NOCOMMAND' });
+    await h.device.onStartup();
+    assert.equal(h.device._started, true);
+    assert.equal(h.device.hasCapability('CMD_SNAPSHOT'), false);
+    assert.equal(h.device.hasCapability('CMD_START_STREAM'), false);
+});
+
+test('older Homey platforms retain video-lock snapshots without registering video', async () => {
+    const h = harness({ type: 55, commands: [CommandName.DeviceStartLivestream] });
+    h.homey.platformVersion = 1;
+    h.device.setImage = async (type) => h.calls.push(['image', type]);
+    await h.device.onStartup();
+    assert.equal(h.device._started, true);
+    assert.deepEqual(h.calls.filter(([name]) => name === 'image'), [['image', 'snapshot'], ['image', 'event']]);
+    assert.equal(h.values.get('locked'), true);
+});
+
+test('camera registration failures warn while preserving valid lock state and commands', async () => {
+    const h = harness({ type: 55, commands: [CommandName.DeviceStartLivestream] });
+    h.homey.app.warn = (...args) => h.calls.push(['warning', ...args]);
+    h.device.setImage = async (type) => {
+        h.calls.push(['image', type]);
+        if (type === 'snapshot') throw new Error('Camera image registration failed');
+    };
+    h.device.setVideo = async () => { throw new Error('Video registration failed'); };
+    await h.device.onStartup();
+    assert.equal(h.device._started, true);
+    assert.equal(h.values.get('locked'), true);
+    assert.equal(h.calls.at(-1)[0], 'warning');
+    assert.equal(h.calls.filter(([name]) => name === 'warning').length, 2);
+    assert.deepEqual(h.calls.filter(([name]) => name === 'image'), [['image', 'snapshot'], ['image', 'event']]);
+    const command = h.listeners.get('locked')(false);
+    await flush();
+    h.client.emit('device property changed', h.remote, PropertyName.DeviceLocked, false);
+    await command;
+    assert.equal(h.values.get('locked'), false);
+});
+
+test('disconnect during camera setup cancels later media registration and stops the device stream', async () => {
+    const h = harness({ type: 55, commands: [CommandName.DeviceStartLivestream] });
+    let releaseImage;
+    h.device.setImage = (type) => {
+        h.calls.push(['image', type]);
+        return new Promise((resolve) => { releaseImage = resolve; });
+    };
+    h.homey.app.FfmpegManager = {
+        ...h.homey.app.FfmpegManager,
+        stopStream: async (serial) => h.calls.push([serial === undefined ? 'stop-all-media' : 'stop-media', serial])
+    };
+    const startup = h.device.onStartup();
+    await new Promise(setImmediate);
+    assert.equal(typeof releaseImage, 'function');
+    h.client.emit('close');
+    releaseImage();
+    await startup;
+    await flush();
+    assert.equal(h.device._started, false);
+    assert.equal(h.values.get('locked'), null);
+    assert.deepEqual(h.calls.filter(([name]) => name === 'image'), [['image', 'snapshot']]);
+    assert.deepEqual(h.calls.filter(([name]) => name === 'stop-media'), [['stop-media', h.remote.getSerial()]]);
+    assert.equal(h.calls.filter(([name]) => name === 'available').length, 1, 'cancelled media startup cannot restore lock availability');
+});
+
+test('video-lock reconnect preserves lock listeners and unloading or deleting releases camera resources', async (t) => {
+    for (const action of ['onUninit', 'onDeleted']) {
+        await t.test(action, async () => {
+            const h = harness({ type: 55, commands: [CommandName.DeviceStartLivestream] });
+            h.device.setImage = async (type) => h.calls.push(['image', type]);
+            h.device.setVideo = async () => h.calls.push(['video']);
+            h.homey.app.removeDevice = () => h.calls.push(['remove']);
+            h.homey.app.FfmpegManager = {
+                ...h.homey.app.FfmpegManager,
+                stopStream: async (serial) => h.calls.push([serial === undefined ? 'stop-all-media' : 'stop-media', serial]),
+                releaseDevice: async (serial) => h.calls.push(['release-media', serial])
+            };
+            await h.device.onStartup();
+            h.client.emit('close');
+            await flush();
+            h.client.emit('connect');
+            await new Promise(setImmediate);
+            assert.equal(h.device._started, true);
+            assert.equal(h.values.get('locked'), true);
+            assert.deepEqual([...h.listeners.keys()], ['locked']);
+            assert.equal(deviceCloseListenerCount(h), 1);
+            assert.equal(h.calls.filter(([name]) => name === 'video').length, 2);
+            await h.device[action]();
+            assert.equal(deviceCloseListenerCount(h), 0);
+            const releases = h.calls.filter(([name]) => name === 'release-media');
+            assert.ok(releases.length >= 1, 'device cleanup must release camera media');
+            assert.ok(releases.every(([, serial]) => serial === h.remote.getSerial()), 'cleanup must target only this lock');
+            assert.equal(h.calls.some(([name]) => name === 'remove'), action === 'onDeleted');
+        });
+    }
+});
+
+test('late camera initialization after deletion cannot register later media or restore lock state', async () => {
+    const h = harness({ type: 55, commands: [CommandName.DeviceStartLivestream] });
+    let releaseImage;
+    h.device.setImage = (type) => {
+        h.calls.push(['image', type]);
+        return new Promise((resolve) => { releaseImage = resolve; });
+    };
+    h.homey.app.removeDevice = () => {};
+    h.homey.app.FfmpegManager = {
+        ...h.homey.app.FfmpegManager,
+        releaseDevice: async (serial) => h.calls.push(['release-media', serial])
+    };
+    const startup = h.device.onStartup();
+    await new Promise(setImmediate);
+    await h.device.onDeleted();
+    const releasesAtDeletion = h.calls.filter(([name]) => name === 'release-media').length;
+    assert.ok(releasesAtDeletion >= 1, 'deletion releases media before late setup finishes');
+    releaseImage();
+    await startup;
+    assert.equal(h.device._started, false);
+    assert.deepEqual(h.calls.filter(([name]) => name === 'image'), [['image', 'snapshot']]);
+    assert.equal(h.calls.filter(([name]) => name === 'available').length, 1);
+    assert.equal(h.calls.filter(([name]) => name === 'release-media').length, releasesAtDeletion + 1, 'a completed late media operation gets another cleanup pass');
+});
+
+test('snapshot and stop-stream Flow cards admit the lock driver only behind camera capabilities', () => {
+    for (const [id, capability] of [
+        ['action_CMD_SNAPSHOT', 'CMD_SNAPSHOT'],
+        ['action_CMD_SNAPSHOT_CUSTOM', 'CMD_SNAPSHOT'],
+        ['action_CMD_STOP_STREAM', 'CMD_START_STREAM']
+    ]) {
+        const card = JSON.parse(fs.readFileSync(path.join(root, '.homeycompose/flow/actions', `${id}.json`), 'utf8'));
+        const device = card.args.find(({ name }) => name === 'device');
+        assert.ok(device.filter.split('&')[0].slice('driver_id='.length).split('|').includes('driver_SMART_LOCK'));
+        assert.ok(device.filter.split('&').includes(`capabilities=${capability}`));
+        assert.ok(device.filter.includes('driver_EUFYCAM'), 'existing camera drivers remain eligible');
+    }
+});
+
 test('initial and reconnect hydration preserves unlocked state and zero battery', async () => {
     const h = harness({ properties: {
         [PropertyName.DeviceLocked]: false,
@@ -287,7 +458,7 @@ test('unknown initial lock state stays unavailable and recovers after its first 
             assert.equal(h.device._started, true);
             assert.equal(h.values.get('locked'), false);
             assert.equal(h.calls.some(([name]) => name === 'available'), true);
-            assert.equal(h.client.listenerCount('close'), 1, 'recovery replaces the connection listener');
+            assert.equal(deviceCloseListenerCount(h), 1, 'recovery replaces the connection listener');
         });
     }
 });
@@ -303,7 +474,7 @@ test('idle client disconnection invalidates lock state and unload clears lifecyc
     assert.match(h.calls.filter(([name]) => name === 'unavailable').at(-1)[1], /Connection|lost/i);
     await assert.rejects(h.device.onCapability_locked(false), /unavailable/i);
     await h.device.onUninit();
-    assert.equal(h.client.listenerCount('close'), 0);
+    assert.equal(deviceCloseListenerCount(h), 0);
     assert.equal(h.client.listenerCount('device property changed'), 1, 'only the shared event helper remains');
 });
 
@@ -320,11 +491,11 @@ test('client reconnect rehydrates an idle lock without duplicating lifecycle lis
     assert.equal(h.device._started, true);
     assert.equal(h.values.get('locked'), false);
     assert.equal(h.calls.at(-1)[0], 'available');
-    assert.equal(h.client.listenerCount('close'), 1);
+    assert.equal(deviceCloseListenerCount(h), 1);
     assert.equal(h.client.listenerCount('connect'), 1);
     assert.equal(h.client.listenerCount('device property changed'), 2);
     await h.device.onUninit();
-    assert.equal(h.client.listenerCount('close'), 0);
+    assert.equal(deviceCloseListenerCount(h), 0);
     assert.equal(h.client.listenerCount('connect'), 0);
     assert.equal(h.client.listenerCount('device property changed'), 1);
 });
@@ -345,7 +516,7 @@ test('unload or deletion during device lookup cancels lock startup before regist
             await startup;
             assert.equal(h.calls.some(([name]) => name === 'available'), false);
             assert.equal(h.calls.some(([name]) => name === 'register'), false);
-            assert.equal(h.client.listenerCount('close'), 0);
+            assert.equal(deviceCloseListenerCount(h), 0);
             assert.equal(h.client.listenerCount('connect'), 0);
         });
     }

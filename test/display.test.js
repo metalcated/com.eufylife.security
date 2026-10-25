@@ -74,6 +74,7 @@ function harness(options = {}) {
     client.pushService = new EventEmitter();
     client.isConnected = () => true;
     const calls = [];
+    const mediaCalls = [];
     const values = new Map();
     const listeners = new Map();
     const settings = {};
@@ -88,7 +89,11 @@ function harness(options = {}) {
             setDevice: async (added) => calls.push(['register', added]),
             removeDevice: (serial) => calls.push(['remove', serial]),
             getSmartDisplayDevice: (serial, options) => client.getDevice(serial, options),
-            getSmartDisplayStatus: () => ({ complete: true })
+            getSmartDisplayStatus: () => ({ complete: true }),
+            FfmpegManager: {
+                stopStream: async (...args) => mediaCalls.push(['stop', ...args]),
+                releaseDevice: async (...args) => mediaCalls.push(['release', ...args])
+            }
         },
         images: { createImage: () => assert.fail('An information-only display must not create camera images') }
     };
@@ -120,7 +125,17 @@ function harness(options = {}) {
     });
     const events = new Events(homey);
     homey.app.eufyEventsHelper = events;
-    return { ...modules, device, remote, client, calls, values, settings, events, listeners };
+    const sharedCloseListeners = client.listeners('close');
+    assert.equal(sharedCloseListeners.length, 1, 'the app-wide media helper owns one close listener');
+    return { ...modules, device, remote, client, calls, values, settings, events, listeners, mediaCalls, sharedCloseListeners };
+}
+
+function deviceCloseListenerCount(h) {
+    const listeners = h.client.listeners('close');
+    for (const shared of h.sharedCloseListeners) {
+        assert.ok(listeners.includes(shared), 'display lifecycle cleanup must preserve the app-wide media close listener');
+    }
+    return listeners.filter((listener) => !h.sharedCloseListeners.includes(listener)).length;
 }
 
 test('display discovery recognizes E10 model or serial and never guesses from its name', () => {
@@ -405,11 +420,11 @@ test('display disconnect and reconnect refresh info without duplicating event su
     assert.equal(h.settings.FIRMWARE_VERSION, '1.2.6');
     assert.equal(h.values.get('measure_battery'), 74);
     assert.equal(h.calls.at(-1)[0], 'available');
-    assert.equal(h.client.listenerCount('close'), 1);
+    assert.equal(deviceCloseListenerCount(h), 1);
     assert.equal(h.client.listenerCount('connect'), 1);
     assert.equal(h.client.listenerCount('device raw property changed'), 1);
     await h.device.onUninit();
-    assert.equal(h.client.listenerCount('close'), 0);
+    assert.equal(deviceCloseListenerCount(h), 0);
     assert.equal(h.client.listenerCount('connect'), 0);
     assert.equal(h.client.listenerCount('device raw property changed'), 0);
 });
@@ -418,7 +433,7 @@ test('display deletion removes event subscriptions and app device bookkeeping', 
     const h = harness();
     await h.device.onStartup(true, 0);
     await h.device.onDeleted();
-    assert.equal(h.client.listenerCount('close'), 0);
+    assert.equal(deviceCloseListenerCount(h), 0);
     assert.equal(h.client.listenerCount('connect'), 0);
     assert.equal(h.client.listenerCount('device raw property changed'), 0);
     assert.deepEqual(h.calls.find(([name]) => name === 'remove'), ['remove', h.remote.getSerial()]);
@@ -439,7 +454,7 @@ test('unload or deletion during device lookup cancels display startup before reg
             assert.equal(h.calls.some(([name]) => name === 'available'), false);
             assert.equal(h.calls.some(([name]) => name === 'register'), false);
             assert.equal(h.client.listenerCount('device raw property changed'), 0);
-            assert.equal(h.client.listenerCount('close'), 0);
+            assert.equal(deviceCloseListenerCount(h), 0);
             assert.equal(h.client.listenerCount('connect'), 0);
         });
     }

@@ -11,18 +11,29 @@ module.exports = class mainDevice extends Homey.Device {
     }
 
     async onStartup(initial = false, index) {
+        const client = this.homey.app.eufyClient;
+        const token = this._cameraStartupToken = (this._cameraStartupToken || 0) + 1;
+        this._cameraDisposed = false;
+        this._started = false;
+        const active = () => !this._cameraDisposed && token === this._cameraStartupToken && client === this.homey.app.eufyClient && client.isConnected();
+        const step = async operation => {
+            if (!active()) throw new Error('Camera startup cancelled.');
+            const value = await operation();
+            if (!active()) throw new Error('Camera startup cancelled.');
+            return value;
+        };
         try {
             const settings = this.getSettings();
 
             this.homey.app.debug(`[Device] ${this.getName()} - starting`);
 
-            this.setUnavailable(`${this.getName()} ${this.homey.__('device.init')}`);
+            await step(() => this.setUnavailable(`${this.getName()} ${this.homey.__('device.init')}`));
 
-            await sleep((index + 1) * 200);
+            await step(() => sleep(((index || 0) + 1) * 200));
 
-            this.EufyDevice = await this.homey.app.eufyClient.getDevice(this.HomeyDevice.device_sn);
+            this.EufyDevice = await step(() => client.getDevice(this.HomeyDevice.device_sn));
             this.HomeyDevice.station_sn = await this.EufyDevice.getStationSerial();
-            this.EufyStation = await this.homey.app.eufyClient.getStation(this.HomeyDevice.station_sn);
+            this.EufyStation = await step(() => client.getStation(this.HomeyDevice.station_sn));
 
             this.HomeyDevice.isStandAlone = this.HomeyDevice.device_sn === this.HomeyDevice.station_sn;
             this.EufyStation.rawStation.member.nick_name = 'Homey';
@@ -34,41 +45,44 @@ module.exports = class mainDevice extends Homey.Device {
                 } - device_sn: ${this.HomeyDevice.device_sn}`
             );
 
-            this.homey.app.setDevice(this);
+            await step(() => this.homey.app.setDevice(this));
 
-            await this.setImage('snapshot');
-            await this.setImage('event');
+            await step(() => this.setImage('snapshot'));
+            await step(() => this.setImage('event'));
 
             if (this.homey.platformVersion === 2) {
-                await this.setVideo();
+                await step(() => this.setVideo());
             }
 
             if (initial) {
-                await this.checkCapabilities();
-                await this.resetCapabilities();
+                await step(() => this.checkCapabilities());
+                await step(() => this.resetCapabilities());
 
-                await this.check_alarm_arm_mode(settings);
-                await this.check_alarm_generic(settings);
-                await this.check_alarm_motion(settings);
+                await step(() => this.check_alarm_arm_mode(settings));
+                await step(() => this.check_alarm_generic(settings));
+                await step(() => this.check_alarm_motion(settings));
 
-                await this.setCapabilitiesListeners();
+                await step(() => this.setCapabilitiesListeners());
             } else {
-                await this.resetCapabilities();
+                await step(() => this.resetCapabilities());
             }
 
-            await this.setAvailable();
-            await this.updateRemoteWarning();
+            await step(() => this.updateRemoteWarning());
 
             const appSettings = this.homey.app.appSettings;
             const ipAddress = appSettings.STATION_IPS[this.HomeyDevice.station_sn] ? appSettings.STATION_IPS[this.HomeyDevice.station_sn] : this.EufyStation.getLANIPAddress();
-            await this.setSettings({
+            await step(() => this.setSettings({
                 LOCAL_STATION_IP: ipAddress,
                 STATION_SN: this.EufyStation.getSerial(),
                 DEVICE_SN: this.EufyDevice.getSerial()
-            });
+            }));
 
+            if (!client.isConnected()) throw new Error('Eufy disconnected during camera startup.');
             this._started = true;
+            await step(() => this.setAvailable());
         } catch (error) {
+            if (token === this._cameraStartupToken) this._started = false;
+            if (!active()) return;
             this.setUnavailable(this.homey.__('device.serial_failure'));
             this.homey.app.error(error);
         }
@@ -81,8 +95,19 @@ module.exports = class mainDevice extends Homey.Device {
     }
 
     onDeleted() {
+        this._cameraDisposed = true;
+        this._cameraStartupToken = (this._cameraStartupToken || 0) + 1;
+        this._started = false;
         const deviceObject = this.getData();
         this.homey.app.removeDevice(deviceObject.device_sn);
+        return this.homey.app.FfmpegManager?.releaseDevice(deviceObject.device_sn);
+    }
+
+    async onUninit() {
+        this._cameraDisposed = true;
+        this._cameraStartupToken = (this._cameraStartupToken || 0) + 1;
+        this._started = false;
+        await this.homey.app.FfmpegManager?.releaseDevice(this.HomeyDevice?.device_sn);
     }
 
     async onSettings({ oldSettings, newSettings, changedKeys }) {
@@ -520,15 +545,7 @@ module.exports = class mainDevice extends Homey.Device {
 
     async onCapability_CMD_STOP_STREAM() {
         try {
-            this.homey.app.log(`[Device] ${this.getName()} - onCapability_CMD_STOP_STREAM => Check if stream is running`);
-
-            if (this.homey.app.FfmpegManager.isRunning || this.EufyStation.isLiveStreaming(this.EufyDevice)) {
-                this.homey.app.log(`[Device] ${this.getName()} - onCapability_CMD_STOP_STREAM => Closing existing stream`);
-                await this.homey.app.FfmpegManager.stopStream();
-                await this.homey.app.eufyClient.stopStationLivestream(this.HomeyDevice.device_sn);
-            } else {
-                this.homey.app.log(`[Device] ${this.getName()} - onCapability_CMD_STOP_STREAM => No existing stream`);
-            }
+            await this.homey.app.FfmpegManager.stopStream(this.HomeyDevice.device_sn);
         } catch (e) {
             this.homey.app.error(e);
             return Promise.reject(e);
@@ -537,45 +554,9 @@ module.exports = class mainDevice extends Homey.Device {
 
     async onCapability_START_LIVESTREAM(type) {
         try {
-            const deviceEnabled = await this.EufyDevice.getPropertyValue(PropertyName.DeviceEnabled);
-            const snapshotTime = !!this.EufyDevice && this.EufyDevice.hasBattery() ? 7 : 6;
-            const streamTime = 300;
-            const isSnapshot = type === 'snapshot';
-            const isVideo = type === 'video';
-
-            if (!isSnapshot && !isVideo) {
-                throw new Error(`Type: ${type} not allowed`);
-            }
-
-            // --- Start checks ---
-            this.homey.app.log(`[Device] ${this.getName()} - onCapability_START_LIVESTREAM => Type`, type);
-
-            if (!isSnapshot && !isVideo) {
-                throw new Error(`Type: ${type} not allowed`);
-            }
-
-            if (isNil(deviceEnabled) || deviceEnabled === false) {
-                throw new Error('Camera is off');
-            }
-            // --- End checks ---
-            // --- Start new stream ---
-            let time = isSnapshot ? snapshotTime : streamTime;
-
-            this.homey.app.log(`[Device] ${this.getName()} - onCapability_START_LIVESTREAM => Set Time`, time);
-
-            await this.homey.app.eufyClient.setCameraMaxLivestreamDuration(time);
-            await this.homey.app.eufyClient.startStationLivestream(this.HomeyDevice.device_sn);
-
-            if (isSnapshot) {
-                await this.homey.app.FfmpegManager.waitForSnapshot(this.HomeyDevice.device_sn, (time + 1) * 1000, Date.now());
-
-                this.homey.app.log(`[Device] ${this.getName()} - onCapability_START_LIVESTREAM => Updating device ${type} image`);
-
-                await this.updateImage(type, this.HomeyDevice.device_sn);
-            }
-
-            return Promise.resolve(true);
-            // --- End of Start new stream ---
+            if (type === 'snapshot') return await this.homey.app.FfmpegManager.requestSnapshot(this);
+            if (type === 'video') return await this.homey.app.FfmpegManager.startVideo(this);
+            throw new Error(`Type: ${type} not allowed`);
         } catch (e) {
             this.homey.app.error(e);
             return Promise.reject(e);
@@ -680,6 +661,7 @@ module.exports = class mainDevice extends Homey.Device {
             this.homey.app.log(`[Device] ${this.getName()} - updateImage - ${imageType} image saved successfully`);
         } catch (error) {
             this.homey.app.error(`[Device] ${this.getName()} - updateImage - Error saving ${imageType} image:`, error);
+            throw error;
         }
     }
 
@@ -694,48 +676,10 @@ module.exports = class mainDevice extends Homey.Device {
 
     async setVideo() {
         try {
-            const isRTSPDevice = this.EufyDevice.hasProperty(PropertyName.DeviceRTSPStream);
-
-            if (!isRTSPDevice) {
-                this.homey.app.log(`[Device] ${this.getName()} - setvideo - device doesnt support native RTSP. Disabling video until FFMPEG RTSP works`, { isRTSPDevice });
-                return;
-            }
-            const video = await this.homey.videos.createVideoRTSP();
-
-            video.registerVideoUrlListener(async () => {
-                const isRTSPDeviceEnabled = !!this.EufyDevice.isRTSPStreamEnabled();
-                const isRTSPDevice = this.EufyDevice.hasProperty(PropertyName.DeviceRTSPStream);
-
-                this.homey.app.log(`[Device] ${this.getName()} - setVideo registerVideoUrlListener -`, isRTSPDeviceEnabled ? 'native' : 'ffmpeg', { isRTSPDevice, isRTSPDeviceEnabled });
-                // if (!isRTSPDevice && !this.EufyStation.isLiveStreaming(this.EufyDevice)) {
-                //     await this.onCapability_START_LIVESTREAM('video');
-                //     await sleep(7500);
-                // }
-
-                if (isRTSPDeviceEnabled) {
-                    await this.EufyStation.startRTSPStream(this.EufyDevice);
-                    const url = await this.EufyDevice.getPropertyValue(PropertyName.DeviceRTSPStreamUrl);
-                    this.homey.app.log(`[Device] ${this.getName()} - setvideo registerVideoUrlListener - request url for native RTSP`, url);
-                    return { url };
-                }
-
-                // check if device is off
-                if (!this.getCapabilityValue('onoff')) {
-                    const url = 'Camera_is_off';
-                    return {
-                        url
-                    };
-                }
-
-                const url = 'RTSP_not_enabled_in_EUFY_app';
-                return {
-                    url
-                };
-            });
-
-            await this.setCameraVideo('main', 'Live', video);
+            await this.homey.app.FfmpegManager.registerVideo(this);
         } catch (err) {
             this.homey.app.error(err);
+            throw err;
         }
     }
 

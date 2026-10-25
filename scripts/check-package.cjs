@@ -31,7 +31,9 @@ async function main() {
             }
             for (const required of ['app.json', 'app.js', 'drivers/main-lock.js', 'drivers/main-display.js',
                 'lib/lock-support.js', 'lib/display-support.js', 'lib/display-discovery.js', 'assets/icon.svg',
-                'node_modules/eufy-security-client/build/index.js']) {
+                'api.js', 'lib/helpers/camera-media.helper.js', 'lib/helpers/camera-wall.helper.js',
+                'settings/index.html', 'settings/camera-wall.js', 'settings/camera-wall.css',
+                'node_modules/eufy-security-client/build/index.js', 'node_modules/homey-api/index.js']) {
                 assert(files.includes(required), `Missing runtime file: ${required}`);
             }
             for (const id of ['driver_SMART_LOCK', 'driver_SMART_DISPLAY']) {
@@ -42,7 +44,7 @@ async function main() {
             assert(files.some(file => /^node_modules\/eufy-security-client\/build\/.*\.proto$/.test(file)), 'Client protocol assets are missing');
             assert(files.some(file => /^node_modules\/eufy-security-client\/build\/.*\.crt$/.test(file)), 'Client certificate assets are missing');
             assert(!files.some(file => /^(test|scripts|\.homeybuild|\.github|\.git|\.homey|\.homeycompose)\//.test(file)), 'Source or installer files leaked into the package');
-            const installerFiles = files.filter(file => /^node_modules\/(sharp|homey-api|inquirer|dockerode|copyfiles)\//.test(file));
+            const installerFiles = files.filter(file => /^node_modules\/(sharp|inquirer|dockerode|copyfiles)\//.test(file));
             assert.equal(installerFiles.length, 0, `Installer dependencies leaked into the package: ${installerFiles.slice(0, 4).join(', ')}`);
             // Homey injects its runtime SDK shim into this directory.
             const sdkFiles = ['index.js', 'package.json'];
