@@ -1,4 +1,7 @@
 {
+  "3.43.1": {
+    "en": "Discover Smart Display E10 through the existing Eufy Mega session and add a manual information refresh action."
+  },
   "3.43.0": {
     "en": "Add grouped smart lock control, including S230 (T8510P) and Video Smart Lock S330 (T8530), plus Smart Display E10 information and reported battery status."
   },

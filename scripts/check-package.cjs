@@ -30,7 +30,7 @@ async function main() {
                 offset += 512 + Math.ceil(size / 512) * 512;
             }
             for (const required of ['app.json', 'app.js', 'drivers/main-lock.js', 'drivers/main-display.js',
-                'lib/lock-support.js', 'lib/display-support.js', 'assets/icon.svg',
+                'lib/lock-support.js', 'lib/display-support.js', 'lib/display-discovery.js', 'assets/icon.svg',
                 'node_modules/eufy-security-client/build/index.js']) {
                 assert(files.includes(required), `Missing runtime file: ${required}`);
             }

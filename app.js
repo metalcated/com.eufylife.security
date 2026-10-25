@@ -17,6 +17,7 @@ const FfmpegManager = require('./lib/helpers/eufy-stream.helper');
 const { sleep, randomNumber, normalizeRemoteLines, fetchRemoteText } = require('./lib/utils');
 
 const Logger = require('./lib/helpers/eufy-logger.helper');
+const { DisplayDiscovery } = require('./lib/display-discovery');
 
 const _settingsKey = `${Homey.manifest.id}.settings`;
 
@@ -118,6 +119,22 @@ class App extends Homey.App {
         }, 30000);
     }
 
+    getSmartDisplayDevices(options) {
+        return this.displayDiscovery.getDevices(this.eufyClient, options);
+    }
+
+    async getSmartDisplayDevice(serial, options) {
+        const device = await this.displayDiscovery.getDevice(this.eufyClient, serial, options);
+        if (options?.refresh && this.getSmartDisplayStatus().error) {
+            throw new Error('The display information could not be refreshed. Please retry later.');
+        }
+        return device;
+    }
+
+    getSmartDisplayStatus() {
+        return this.displayDiscovery.getStatus(this.eufyClient);
+    }
+
     // -------------------- SETTINGS ----------------------
 
     async initGlobarVars() {
@@ -129,6 +146,7 @@ class App extends Homey.App {
 
         this.deviceList = [];
         this.deviceTypes = DEVICE_TYPES;
+        this.displayDiscovery = new DisplayDiscovery();
 
         this.eufyClientConnected = false;
         this.eufyClient = null;

@@ -27,15 +27,19 @@ module.exports = class mainDisplay extends Homey.Device {
             return result;
         };
         this.cleanupDisplayListeners();
+        this._displayRefresh = null;
         this._started = false;
         try {
             await step(() => this.setUnavailable(`${this.getName()} ${this.homey.__('device.init')}`));
-            this.EufyDevice = await step(() => this.homey.app.eufyClient.getDevice(this.HomeyDevice.device_sn));
+            this.EufyDevice = await step(() => this.homey.app.getSmartDisplayDevice(this.HomeyDevice.device_sn));
             if (!isSupportedDisplay(this.EufyDevice)) throw new Error('This device is not an E10 smart display.');
             this.HomeyDevice.station_sn = this.EufyDevice.getStationSerial();
             await step(() => this.homey.app.setDevice(this));
+            if (!this.hasCapability('button.refresh')) await step(() => this.addCapability('button.refresh'));
+            this.registerCapabilityListener('button.refresh', this.refreshFromCloud.bind(this));
             this.setDisplayListeners();
             await step(() => this.refreshInfo());
+            await step(() => this.updateDiscoveryWarning());
             if (!client.isConnected()) throw new Error('Connection to Eufy was lost during display startup.');
             this._started = true;
             await step(() => this.setAvailable());
@@ -51,8 +55,47 @@ module.exports = class mainDisplay extends Homey.Device {
         await this.onStartup();
     }
 
-    async refreshInfo() {
-        if (this._displayDisposed) return;
+    displayUpdateGuard() {
+        const token = this._displayStartupToken;
+        const client = this.homey.app.eufyClient;
+        return () => !this._displayDisposed && token === this._displayStartupToken && client === this.homey.app.eufyClient;
+    }
+
+    async updateDiscoveryWarning(active = this.displayUpdateGuard()) {
+        if (!active()) return;
+        if (this.homey.app.getSmartDisplayStatus().error) {
+            await this.setWarning('Some display information could not be refreshed. Last reported values are shown.');
+        } else {
+            await this.unsetWarning();
+        }
+    }
+
+    async refreshFromCloud() {
+        if (!this._started || this._displayDisposed || !this.homey.app.eufyClient.isConnected()) {
+            throw new Error('The display is unavailable. Reconnect Eufy and retry.');
+        }
+        if (this._displayRefresh) return this._displayRefresh;
+        const active = this.displayUpdateGuard();
+        const ensureActive = () => { if (!active()) throw new Error('Display refresh cancelled.'); };
+        const request = (async () => {
+            const device = await this.homey.app.getSmartDisplayDevice(this.HomeyDevice.device_sn, { refresh: true });
+            ensureActive();
+            this.EufyDevice = device;
+            await this.refreshInfo(active);
+            ensureActive();
+            await this.updateDiscoveryWarning(active);
+            ensureActive();
+        })();
+        this._displayRefresh = request;
+        try {
+            return await request;
+        } finally {
+            if (this._displayRefresh === request) this._displayRefresh = null;
+        }
+    }
+
+    async refreshInfo(active = this.displayUpdateGuard()) {
+        if (!active()) return;
         // main_sw_version is verified cloud metadata. Raw display parameter 8003
         // has no verified meaning and must not be presented as firmware.
         await this.setSettings({
@@ -62,13 +105,15 @@ module.exports = class mainDisplay extends Homey.Device {
             DEVICE_SN: reportedText(this.EufyDevice.getSerial()),
             STATION_SN: reportedText(this.EufyDevice.getStationSerial())
         });
-        await this.updateBattery(this.EufyDevice.getRawProperty(displayBatteryParameter));
+        if (!active()) return;
+        await this.updateBattery(this.EufyDevice.getRawProperty(displayBatteryParameter), active);
     }
 
-    async updateBattery(rawValue) {
-        if (this._displayDisposed) return;
+    async updateBattery(rawValue, active = this.displayUpdateGuard()) {
+        if (!active()) return;
         const value = parseBatteryPercentage(rawValue);
         if (value !== null && !this.hasCapability('measure_battery')) await this.addCapability('measure_battery');
+        if (!active()) return;
         if (this.hasCapability('measure_battery')) await this.setCapabilityValue('measure_battery', value);
     }
 

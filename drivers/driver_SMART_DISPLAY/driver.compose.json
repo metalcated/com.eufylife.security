@@ -3,7 +3,14 @@
     "en": "Smart Display E10"
   },
   "class": "other",
-  "capabilities": [],
+  "capabilities": ["button.refresh"],
+  "capabilitiesOptions": {
+    "button.refresh": {
+      "maintenanceAction": true,
+      "title": { "en": "Refresh information" },
+      "desc": { "en": "Read the display's latest available information from Eufy." }
+    }
+  },
   "images": {
     "small": "/assets/images/small.jpg",
     "large": "/assets/images/large.jpg"

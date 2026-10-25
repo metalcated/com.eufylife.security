@@ -22,6 +22,11 @@ module.exports = class mainDriver extends Homey.Driver {
         return this.deviceType().some((model) => device.rawDevice.device_sn.includes(model));
     }
 
+    async getDiscoveryDevices() {
+        if (this.driverType() === 'stations') return this.homey.app.eufyClient.getStations();
+        return this.homey.app.eufyClient.getDevices();
+    }
+
     async onPair(session) {
         this.type = 'pair';
         this.setPairingSession(session);
@@ -122,7 +127,7 @@ module.exports = class mainDriver extends Homey.Driver {
 
                             session.showView('error');
                         } else {
-                            this.deviceError = this.type === 'repair' ? this.homey.__('pair.no_devices_repair') : this.homey.__('pair.no_devices');
+                            this.deviceError = this.deviceError || (this.type === 'repair' ? this.homey.__('pair.no_devices_repair') : this.homey.__('pair.no_devices'));
                         }
                         
                         session.showView('error');
@@ -184,13 +189,7 @@ module.exports = class mainDriver extends Homey.Driver {
                 ctx.homey.app.log(`[Driver] ${ctx.id} - eufyDeviceData - try: ${i}`);
                 await sleep(1000);
 
-                let eufyDevices = [];
-
-                if (ctx.driverType() === 'stations') {
-                    eufyDevices = await ctx.homey.app.eufyClient.getStations();
-                } else {
-                    eufyDevices = await ctx.homey.app.eufyClient.getDevices();
-                }
+                const eufyDevices = await ctx.getDiscoveryDevices();
 
                 if (eufyDevices.length) {
                     return Promise.resolve(eufyDevices);
