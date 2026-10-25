@@ -45,6 +45,25 @@ and use it with this library.
 - Provide your Username and Password. Click Next
 - Available devices show up
 
+# Install this fork on Homey Self-Hosted Server
+
+The Docker installer follows the existing Lennox/Rinnai workflow. On your Mac, with Docker running, use:
+
+```bash
+HOMEY_AUTH_VOLUME=homey-lennox-cli-auth \
+bash /Users/mgomon/Code/homey/com.eufylife.security/scripts/install.sh --via-foreman
+```
+
+This explicitly reuses the Homey CLI login volume from the Lennox installer. Select the self-hosted Homey when prompted. If Homey asks for authorization, open the displayed link in your browser and enter any sign-in code only into the terminal. Account credentials stay in the selected Docker volume.
+
+For a separate Eufy login volume, omit `HOMEY_AUTH_VOLUME`. To use a directly reachable Homey, omit `--via-foreman`. The script can be launched by absolute path from any directory; a new checkout uses `bash scripts/install.sh --via-foreman` from its own directory. `HOMEY_ID` optionally selects a known Homey by ID, and `HOMEY_SSH_JUMP`, `HOMEY_SSH_TARGET`, and `HOMEY_TUNNEL_PORT` override the defaults `foreman.gnet.com`, `iot-mgmt`, and `14859`.
+
+The installer builds and tests entirely inside Docker with Node 24 and pinned Homey CLI 4.6.1. It fetches the pinned public Eufy client over HTTPS, without mounting your SSH keys. Installer dependencies are kept outside the app's production dependency tree. The build consumes and checks the real upload archive, including both new drivers' pairing/repair views and the Eufy client's compiled protocol assets.
+
+With `--via-foreman`, installation uses a temporary localhost-only tunnel to the self-hosted server. Before sending authenticated requests through it, the installer verifies that the endpoint belongs to the selected Homey. It uploads with `clean:false`, preserving existing app data and paired devices, and verifies the expected app ID and version become enabled and running. Upload failures are reported as failures even if an older app is still running.
+
+Installation replaces the Eufy app using its existing ID `com.eufylife.security`. It does not pair devices, operate locks, restart the Homey server, or apply the separate Lennox/Homey web patches. Keep a backup of the installed Eufy app and Homey data before upgrading. The SSH tunnel closes on exit; installer containers and the authentication volume are retained.
+
 # Smart locks in this fork
 
 Version 3.43.0 adds **Eufy Security → Smart Lock** in Homey's device picker. It uses Homey's native lock control and Flow cards, reported lock state, and battery readings where the device exposes them. Existing camera, doorbell, sensor, and HomeBase drivers retain their pairing and controls.

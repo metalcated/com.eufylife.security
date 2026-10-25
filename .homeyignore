@@ -1,0 +1,17 @@
+.git/
+.github/
+.homey/
+.homeycompose/
+.homeybuild/
+test/
+scripts/
+Dockerfile
+.dockerignore
+.gitignore
+.homeyignore
+.npmrc
+.env
+.env.*
+env.json
+*.log
+*.md

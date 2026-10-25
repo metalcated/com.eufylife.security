@@ -1,0 +1,13 @@
+node_modules
+.homeybuild
+.git
+.github
+.homey
+.npmrc
+.env
+.env.*
+env.json
+*.log
+*.tgz
+*.tar
+.DS_Store
