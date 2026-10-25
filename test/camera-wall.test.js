@@ -36,7 +36,9 @@ function harness(t, options = {}) {
             unset(key) { calls.push(['clear', key]); settings.delete(key); }
         },
         app: { deviceList: [], appSettings: { retained: true }, FfmpegManager: {
-            videos: new Map(), supports: device => device?.camera === true,
+            videos: new Map(), sessions: new Map(), stationOwners: new Map(), maxSessions: 4,
+            supports: device => device?.camera === true,
+            nativeEnabled: device => device.native === true,
             assertCamera(device) { if (!device.ready || device.privacy) throw Error(SECRET); }
         } }
     };
@@ -51,7 +53,7 @@ function harness(t, options = {}) {
             getId() { return `DEVICE_${index}`; },
             getName() { return `Camera ${index}`; },
             getAvailable() { return this.available; },
-            EufyDevice: { camera: true, getSerial() { return `SERIAL_${index}`; } },
+            EufyDevice: { camera: true, getSerial() { return `SERIAL_${index}`; }, getStationSerial() { return `HOMEBASE_${index}`; } },
             ...options
         };
         homey.app.deviceList.push(device);
@@ -185,6 +187,111 @@ test('the four-view limit also counts concurrent pending negotiations', async t 
     await Promise.all(offers);
     assert.equal(h.calls.filter(call => call[0] === 'client').length, 1);
     assert.equal(h.calls.filter(call => call[0] === 'offer').length, 4);
+});
+
+test('a busy P2P HomeBase is explained before requesting video without changing source ownership', async t => {
+    const h = harness(t);
+    const camera = h.camera();
+    const media = h.homey.app.FfmpegManager;
+    media.stationOwners.set(camera.EufyDevice.getStationSerial(), SECRET);
+    media.sessions.set(SECRET, { untouched: true });
+    const before = [...media.stationOwners];
+    await assert.rejects(h.manager.offer('DEVICE_1', OFFER), error => {
+        safeError(error);
+        assert.match(error.message, /HomeBase is busy streaming/);
+        assert.doesNotMatch(error.message, /API key/);
+        return true;
+    });
+    assert.equal(h.calls.length, 0);
+    assert.equal(h.manager.handles.size, 0);
+    assert.deepEqual([...media.stationOwners], before);
+    assert.deepEqual([...media.sessions], [[SECRET, { untouched: true }]]);
+});
+
+test('full P2P source capacity is refused before negotiation but an existing own source is shared', async t => {
+    const h = harness(t);
+    const camera = h.camera();
+    const media = h.homey.app.FfmpegManager;
+    media.maxSessions = 1;
+    media.sessions.set(SECRET, { untouched: true });
+    await assert.rejects(h.manager.offer('DEVICE_1', OFFER), error => {
+        safeError(error);
+        assert.match(error.message, /stream limit/);
+        return true;
+    });
+    assert.equal(h.calls.length, 0);
+    media.sessions.set(camera.EufyDevice.getSerial(), { shared: true });
+    const view = await h.manager.offer('DEVICE_1', OFFER);
+    assert.match(view.handle, /^[0-9a-f]{48}$/);
+    assert.equal(media.sessions.size, 2, 'the wall must not reserve or release source sessions');
+});
+
+test('working native RTSP bypasses P2P station ownership and source capacity', async t => {
+    const h = harness(t);
+    const camera = h.camera();
+    const media = h.homey.app.FfmpegManager;
+    camera.EufyDevice.native = true;
+    media.maxSessions = 1;
+    media.sessions.set(SECRET, {});
+    media.stationOwners.set(camera.EufyDevice.getStationSerial(), SECRET);
+    const view = await h.manager.offer('DEVICE_1', OFFER);
+    assert.match(view.handle, /^[0-9a-f]{48}$/);
+    assert.equal(h.calls.filter(call => call[0] === 'offer').length, 1);
+    assert.equal(media.stationOwners.get(camera.EufyDevice.getStationSerial()), SECRET);
+});
+
+test('a HomeBase becoming busy during API setup prevents stale negotiation', async t => {
+    const pending = deferred();
+    const h = harness(t, { createLocalAPI: () => pending.promise });
+    const camera = h.camera();
+    const offer = h.manager.offer('DEVICE_1', OFFER);
+    h.homey.app.FfmpegManager.stationOwners.set(camera.EufyDevice.getStationSerial(), SECRET);
+    pending.resolve(h.api);
+    await assert.rejects(offer, /HomeBase is busy streaming/);
+    assert.equal(h.calls.filter(call => call[0] === 'offer').length, 0);
+    assert.equal(h.manager.handles.size, 0);
+});
+
+test('native-to-P2P fallback reports current busy or capacity state after a redacted backend rejection', async t => {
+    for (const reason of ['station', 'capacity']) {
+        let camera;
+        const h = harness(t, { videoOffer: async () => {
+            camera.EufyDevice.native = false;
+            const media = h.homey.app.FfmpegManager;
+            if (reason === 'station') media.stationOwners.set(camera.EufyDevice.getStationSerial(), SECRET);
+            else { media.maxSessions = 1; media.sessions.set(SECRET, {}); }
+            throw Error(SECRET + API_KEY);
+        } });
+        camera = h.camera();
+        camera.EufyDevice.native = true;
+        await assert.rejects(h.manager.offer('DEVICE_1', OFFER), error => {
+            safeError(error);
+            assert.match(error.message, reason === 'station' ? /HomeBase is busy streaming/ : /stream limit/);
+            assert.doesNotMatch(error.message, /API key/);
+            return true;
+        });
+        assert.equal(h.calls.filter(call => call[0] === 'offer').length, 1);
+        assert.equal(h.manager.handles.size, 0);
+    }
+});
+
+test('only internally created public errors survive negotiation; backend markers cannot leak details', async t => {
+    const backendError = Object.assign(Error(SECRET + API_KEY), { cameraWallPublic: true });
+    const raw = harness(t, { videoOffer: async () => { throw backendError; } });
+    raw.camera();
+    await assert.rejects(raw.manager.offer('DEVICE_1', OFFER), safeError);
+    const pending = deferred();
+    const privacy = harness(t, { createLocalAPI: () => pending.promise });
+    const camera = privacy.camera();
+    const offer = privacy.manager.offer('DEVICE_1', OFFER);
+    camera.privacy = true;
+    pending.resolve(privacy.api);
+    await assert.rejects(offer, error => {
+        safeError(error);
+        assert.match(error.message, /privacy mode/);
+        return true;
+    });
+    assert.equal(privacy.manager.handles.size, 0);
 });
 
 test('handle/device binding and camera replacement gate keepalives without affecting another view', async t => {

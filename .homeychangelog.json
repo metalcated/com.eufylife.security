@@ -1,4 +1,7 @@
 {
+  "3.44.2": {
+    "en": "Check battery-camera NAS media readiness and fall back to Eufy P2P without interrupting another camera on the same HomeBase."
+  },
   "3.44.1": {
     "en": "Convert HEVC camera streams to bounded H.264 video for browser and Homey WebRTC compatibility."
   },

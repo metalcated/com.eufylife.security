@@ -121,7 +121,7 @@ function harness(t, options = {}) {
     const manager = new Manager(homey, {
         userdata: '/virtual/camera-tests', startTimeoutMs: 101, snapshotTimeoutMs: 102, idleTimeoutMs: 103, maxDurationMs: 104,
         resolveBinary: async () => { calls.push(['resolve-binary']); return options.resolveBinary ? options.resolveBinary() : '/virtual/ffmpeg'; },
-        spawn: (command, args) => { const proc = fakeProcess(command, args); processes.push(proc); return proc; },
+        spawn: (command, args, options) => { const proc = fakeProcess(command, args); proc.options = options; processes.push(proc); return proc; },
         createServer: (handler) => {
             const server = new EventEmitter();
             server.handler = handler;
@@ -145,6 +145,7 @@ function harness(t, options = {}) {
             getPropertyValue: (name) => values[name],
             isRTSPStreamEnabled: () => values[PropertyName.DeviceRTSPStream] === true
         };
+        if (Object.hasOwn(settings, 'battery')) device.hasBattery = () => settings.battery;
         const homeyDevice = { EufyDevice: device, _started: true, values, registrations: [], images: [],
             EufyStation: { startRTSPStream: () => calls.push(['native-start', serial]) },
             async setCameraVideo(...args) { this.registrations.push(args); },
@@ -282,6 +283,249 @@ test('native RTSP snapshot sessions retain copy behavior when their source codec
     assert.equal(proc.args.includes('-vf'), false);
     proc.stdout.emit('data', transportPackets());
     await session.ready.promise;
+});
+
+test('battery NAS views coalesce one bounded decoded-frame probe and return working native video', async (t) => {
+    const h = harness(t);
+    const camera = h.camera('BATTERY', 'HOMEBASE', { native: true, battery: true,
+        values: { [PropertyName.DeviceRTSPStreamUrl]: 'rtsp://fixture-camera/live' } });
+    await h.manager.registerVideo(camera);
+    await h.manager.registerVideo(camera);
+    assert.equal(h.videos.length, 1);
+    assert.equal(h.videos[0].type, 'other');
+    assert.equal(h.videos[0].config, undefined);
+    const first = h.videos[0].listener();
+    const second = h.videos[0].listener();
+    let settled = false;
+    first.then(() => { settled = true; }, () => { settled = true; });
+    await flush();
+    assert.equal(h.processes.length, 1);
+    assert.deepEqual(h.calls.filter(([type]) => type === 'native-start'), [['native-start', 'BATTERY']]);
+    const probe = h.processes[0];
+    assert.equal(probe.args[probe.args.indexOf('-frames:v') + 1], '1');
+    assert.equal(probe.args[probe.args.indexOf('-progress') + 1], 'pipe:1');
+    assert.deepEqual(probe.options.stdio, ['ignore', 'pipe', 'ignore']);
+    assert.deepEqual(probe.args.flatMap((arg, i) => arg === '-threads' ? [probe.args[i + 1]] : []), ['1', '1']);
+    probe.stdout.emit('data', Buffer.from('fra'));
+    probe.stdout.emit('data', Buffer.from('me=1\nprogress=end\n'));
+    probe.emit('exit', 0);
+    await flush();
+    assert.equal(settled, false);
+    probe.complete(0);
+    assert.deepEqual(await Promise.all([first, second]), [{ url: 'rtsp://fixture-camera/live' }, { url: 'rtsp://fixture-camera/live' }]);
+    assert.equal(h.manager.p2pFallback.has('BATTERY'), false);
+    assert.equal(h.manager.nativeEnabled(camera.EufyDevice), true);
+    assert.equal(h.manager.nativeProbes.size, 0);
+    assert.equal(h.manager.nativeProbeProcesses.size, 0);
+    assert.equal(h.servers.length, 0);
+    assert.equal(h.calls.some(([type]) => type === 'start'), false);
+    assert.equal(h.client.listenerCount('close'), 0);
+    assert.equal([...h.timers].some(({ delay }) => delay === 5000), false);
+});
+
+test('battery NAS EOF, decoder failure, and timeout select P2P without retrying NAS during the same client session', async (t) => {
+    for (const failure of ['eof', 'decode', 'spawn', 'timeout']) {
+        await t.test(failure, async (subtest) => {
+            const h = harness(subtest);
+            const camera = h.camera('BATTERY', 'HOMEBASE', { native: true, battery: true,
+                values: { [PropertyName.DeviceRTSPStreamUrl]: 'rtsp://fixture-camera/live' } });
+            await h.manager.registerVideo(camera);
+            const request = h.videos[0].listener();
+            await flush();
+            const probe = h.processes[0];
+            if (failure === 'decode') { probe.stdout.emit('data', Buffer.from('frame=1\n')); probe.complete(1); }
+            else if (failure === 'spawn') { probe.emit('error', Error('Fixture process failed')); probe.complete(1); }
+            else if (failure === 'timeout') { h.fireTimer(5000); probe.complete(1); }
+            else probe.complete(0);
+            const first = await request;
+            assert.match(first.url, /^http:\/\/127\.0\.0\.1:46543\/live\/[a-f0-9]{48}\.ts$/);
+            assert.equal(h.manager.p2pFallback.has('BATTERY'), true);
+            assert.equal(h.manager.nativeEnabled(camera.EufyDevice), false);
+            assert.equal(h.manager.nativeConfigured(camera.EufyDevice), true);
+            assert.deepEqual(await h.videos[0].listener(), first);
+            assert.equal(h.processes.length, 1);
+            assert.deepEqual(h.calls.filter(([type]) => type === 'native-start'), [['native-start', 'BATTERY']]);
+            assert.equal(h.calls.some(([type]) => type === 'start'), false);
+            const session = await h.manager.getSession(camera);
+            await flush();
+            assert.equal(session.native, false);
+            assert.equal(h.manager.stationOwners.get('HOMEBASE'), 'BATTERY');
+            assert.deepEqual(h.calls.filter(([type]) => type === 'start'), [['start', 'BATTERY']]);
+            await h.deliver(camera);
+            await session.ready.promise;
+            assert.equal(h.manager.getStatus('BATTERY').state, 'streaming');
+        });
+    }
+});
+
+test('a missing battery NAS address falls back without running a decoder', async (t) => {
+    const h = harness(t);
+    const camera = h.camera('BATTERY', 'HOMEBASE', { native: true, battery: true });
+    await h.manager.registerVideo(camera);
+    const request = h.videos[0].listener();
+    h.fireTimer(101);
+    assert.match((await request).url, /^http:\/\/127\.0\.0\.1:/);
+    assert.equal(h.processes.length, 0);
+    assert.equal(h.manager.p2pFallback.has('BATTERY'), true);
+    assert.equal(h.client.listenerCount('device property changed'), 0);
+});
+
+test('battery fallback keeps the HomeBase P2P ownership guard', async (t) => {
+    const h = harness(t);
+    const busy = await h.manager.getSession(h.camera('OTHER', 'SHARED'));
+    const camera = h.camera('BATTERY', 'SHARED', { native: true, battery: true,
+        values: { [PropertyName.DeviceRTSPStreamUrl]: 'rtsp://fixture-camera/live' } });
+    await h.manager.registerVideo(camera);
+    const request = h.videos[0].listener();
+    await flush();
+    h.processes[0].complete(0);
+    await request;
+    await assert.rejects(h.manager.getSession(camera), /another camera.*homebase/i);
+    assert.equal(h.manager.sessions.get('OTHER'), busy);
+    assert.equal(h.manager.stationOwners.get('SHARED'), 'OTHER');
+    assert.deepEqual(h.calls.filter(([type]) => type === 'start'), [['start', 'OTHER']]);
+});
+
+test('missing, unknown, and false battery reports retain the wired native video path', async (t) => {
+    for (const report of ['missing', undefined, false]) {
+        await t.test(String(report), async (subtest) => {
+            const h = harness(subtest);
+            const settings = { native: true, values: { [PropertyName.DeviceRTSPStreamUrl]: 'rtsp://fixture-camera/live' } };
+            if (report !== 'missing') settings.battery = report;
+            const camera = h.camera('WIRED', 'HOMEBASE', settings);
+            await h.manager.registerVideo(camera);
+            assert.equal(h.videos[0].type, 'rtsp');
+            assert.deepEqual(await h.videos[0].listener(), { url: 'rtsp://fixture-camera/live' });
+            assert.equal(h.processes.length, 0);
+            assert.equal(h.manager.nativeProbes.size, 0);
+            assert.equal(h.manager.p2pFallback.size, 0);
+        });
+    }
+});
+
+test('stop, release, reset, disposal, disconnect, privacy, and registration changes cannot publish a late probe or trigger fallback', async (t) => {
+    for (const action of ['stop', 'release', 'reset', 'dispose', 'disconnect', 'privacy', 'rtsp_disabled', 'registration', 'client']) {
+        await t.test(action, async (subtest) => {
+            const h = harness(subtest);
+            const camera = h.camera('BATTERY', 'HOMEBASE', { native: true, battery: true,
+                values: { [PropertyName.DeviceRTSPStreamUrl]: 'rtsp://fixture-camera/live' } });
+            await h.manager.registerVideo(camera);
+            const request = h.videos[0].listener();
+            const rejected = assert.rejects(request, /stopped|cancel|disconnect|privacy|switched off|shutting down/i);
+            await flush();
+            const probe = h.processes[0];
+            if (action === 'stop') await h.manager.stopStream('BATTERY');
+            else if (action === 'release') await h.manager.releaseDevice('BATTERY');
+            else if (action === 'reset') await h.manager.reset();
+            else if (action === 'dispose') await h.manager.dispose();
+            else if (action === 'disconnect') h.client.emit('close');
+            else if (action === 'privacy') camera.values.enabled = false;
+            else if (action === 'rtsp_disabled') camera.values.rtspStream = false;
+            else if (action === 'registration') {
+                camera.EufyDevice = { ...camera.EufyDevice };
+                await h.manager.registerVideo(camera);
+            } else h.homey.app.eufyClient = new EventEmitter();
+            probe.stdout.emit('data', Buffer.from('frame=1\nprogress=end\n'));
+            probe.complete(0);
+            await rejected;
+            assert.equal(h.manager.p2pFallback.size, 0);
+            assert.equal(h.manager.nativeProbes.size, 0);
+            assert.equal(h.manager.nativeProbeProcesses.size, 0);
+            assert.equal(h.servers.length, 0);
+            assert.equal(h.calls.some(([type]) => type === 'start'), false);
+            assert.equal(h.client.listenerCount('close'), 0);
+            assert.equal([...h.timers].some(({ delay }) => delay === 5000), false);
+        });
+    }
+});
+
+test('Stop during relay preparation cannot return a late battery fallback URL', async (t) => {
+    for (const scope of ['device', 'all']) {
+        await t.test(scope, async (subtest) => {
+            const h = harness(subtest);
+            const server = deferred();
+            const camera = h.camera('BATTERY', 'HOMEBASE', { native: true, battery: true,
+                values: { [PropertyName.DeviceRTSPStreamUrl]: 'rtsp://fixture-camera/live' } });
+            await h.manager.registerVideo(camera);
+            h.manager.ensureServer = () => server.promise;
+            const request = h.videos[0].listener();
+            const rejected = assert.rejects(request, /cancel/i);
+            await flush();
+            h.processes[0].complete(0);
+            await flush();
+            assert.equal(h.manager.p2pFallback.has('BATTERY'), true);
+            await h.manager.stopStream(scope === 'device' ? 'BATTERY' : undefined);
+            server.resolve();
+            await rejected;
+            assert.equal(h.calls.some(([type]) => type === 'start'), false);
+        });
+    }
+});
+
+test('cancelling during binary preparation never launches a late NAS probe', async (t) => {
+    const binary = deferred();
+    const h = harness(t, { resolveBinary: () => binary.promise });
+    const camera = h.camera('BATTERY', 'HOMEBASE', { native: true, battery: true,
+        values: { [PropertyName.DeviceRTSPStreamUrl]: 'rtsp://fixture-camera/live' } });
+    await h.manager.registerVideo(camera);
+    const request = h.videos[0].listener();
+    const rejected = assert.rejects(request, /stopped|cancel/i);
+    await flush();
+    await h.manager.releaseDevice('BATTERY');
+    await rejected;
+    binary.resolve('/virtual/ffmpeg');
+    await flush();
+    assert.equal(h.processes.length, 0);
+    assert.equal(h.manager.nativeProbes.size, 0);
+    assert.equal(h.manager.p2pFallback.size, 0);
+    assert.equal(h.client.listenerCount('close'), 0);
+});
+
+test('at most four NAS checks run and stopping all cancels every pending check', async (t) => {
+    const h = harness(t);
+    const requests = [];
+    for (let i = 0; i < 5; i++) {
+        await h.manager.registerVideo(h.camera(`BATTERY_${i}`, `BASE_${i}`, { native: true, battery: true,
+            values: { [PropertyName.DeviceRTSPStreamUrl]: 'rtsp://fixture-camera/live' } }));
+        if (i < 4) requests.push(assert.rejects(h.videos[i].listener(), /stopped|cancel/i));
+    }
+    await flush();
+    assert.equal(h.processes.length, 4);
+    assert.equal(h.manager.nativeProbes.size, 4);
+    await assert.rejects(h.videos[4].listener(), /four camera connections/i);
+    assert.equal(h.manager.p2pFallback.size, 0);
+    assert.equal(h.calls.filter(([type]) => type === 'native-start').length, 4);
+    await h.manager.stopStream();
+    await Promise.all(requests);
+    for (const proc of h.processes) { assert.equal(proc.kills.length > 0, true); proc.complete(1); }
+    assert.equal(h.manager.nativeProbes.size, 0);
+    assert.equal(h.manager.nativeProbeProcesses.size, 0);
+    assert.equal(h.client.listenerCount('close'), 0);
+    assert.equal([...h.timers].some(({ delay }) => delay === 5000), false);
+});
+
+test('client reset clears battery fallback and rebinds video so native NAS can be checked again', async (t) => {
+    const h = harness(t);
+    const camera = h.camera('BATTERY', 'HOMEBASE', { native: true, battery: true,
+        values: { [PropertyName.DeviceRTSPStreamUrl]: 'rtsp://fixture-camera/live' } });
+    await h.manager.registerVideo(camera);
+    const first = h.videos[0].listener();
+    await flush();
+    h.processes[0].complete(0);
+    await first;
+    assert.equal(h.manager.p2pFallback.has('BATTERY'), true);
+    await h.manager.reset();
+    assert.equal(h.manager.p2pFallback.size, 0);
+    await assert.rejects(h.videos[0].listener(), /cancel/i);
+    await h.manager.registerVideo(camera);
+    assert.equal(h.videos.length, 2);
+    assert.equal(h.videos[0].unregisterCount, 1);
+    const retried = h.videos[1].listener();
+    await flush();
+    h.processes[1].stdout.emit('data', Buffer.from('frame=1\n'));
+    h.processes[1].complete(0);
+    assert.deepEqual(await retried, { url: 'rtsp://fixture-camera/live' });
+    assert.equal(h.manager.p2pFallback.size, 0);
 });
 
 test('unreported camera privacy and a disconnected P2P client cannot start a source', async t => {
