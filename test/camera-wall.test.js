@@ -86,6 +86,22 @@ test('status exposes camera health without credentials, source URLs, serials, or
     assert.equal(h.manager.status().cameras[0].videoRegistered, false);
 });
 
+test('duplicate wall names identify a video lock and camera without renaming Homey devices or changing IDs', t => {
+    const h = harness(t);
+    const camera = h.camera(1, { getName: () => 'Basement Door', driver: { id: 'driver_INDOOR_CAM' } });
+    const lock = h.camera(2, { getName: () => 'Basement Door', driver: { id: 'driver_SMART_LOCK' } });
+    const other = h.camera(3);
+    assert.deepEqual(h.manager.status().cameras.map(({ id, name }) => ({ id, name })), [
+        { id: 'DEVICE_1', name: 'Basement Door (camera)' },
+        { id: 'DEVICE_2', name: 'Basement Door (video lock)' },
+        { id: 'DEVICE_3', name: 'Camera 3' }
+    ]);
+    assert.equal(camera.getName(), 'Basement Door');
+    assert.equal(lock.getName(), 'Basement Door');
+    assert.equal(other.getName(), 'Camera 3');
+    assert.deepEqual([camera.getId(), lock.getId(), other.getId()], ['DEVICE_1', 'DEVICE_2', 'DEVICE_3']);
+});
+
 test('a key is validated through camera read access before saving only the dedicated DB setting', async t => {
     const h = harness(t, { configured: false });
     const status = await h.manager.configure(API_KEY);

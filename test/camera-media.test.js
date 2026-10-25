@@ -528,6 +528,96 @@ test('client reset clears battery fallback and rebinds video so native NAS can b
     assert.equal(h.manager.p2pFallback.size, 0);
 });
 
+test('a snapshot opened before Live View probes battery NAS and publishes a fresh P2P image when NAS fails', async (t) => {
+    const h = harness(t);
+    const camera = h.camera('BATTERY', 'HOMEBASE', { native: true, battery: true,
+        values: { [PropertyName.DeviceRTSPStreamUrl]: 'rtsp://fixture-camera/live' } });
+    await h.manager.registerVideo(camera);
+    const snapshot = h.manager.requestSnapshot(camera);
+    const concurrent = h.manager.getSession(camera);
+    await flush();
+    assert.equal(h.manager.sessions.size, 0);
+    assert.equal(h.processes.length, 1);
+    assert.equal(h.processes[0].args.includes('-progress'), true);
+    assert.equal(h.calls.some(([type]) => type === 'start'), false);
+    h.processes[0].complete(0);
+    const session = await concurrent;
+    await flush();
+    assert.equal(session.native, false);
+    assert.equal(h.manager.sessions.size, 1);
+    assert.equal(h.manager.stationOwners.get('HOMEBASE'), 'BATTERY');
+    assert.deepEqual(h.calls.filter(([type]) => type === 'start'), [['start', 'BATTERY']]);
+    await h.deliver(camera);
+    const decoder = h.processes.find((proc) => proc.args.includes('image2pipe'));
+    const jpeg = Buffer.from([0xff, 0xd8, 5, 0xff, 0xd9]);
+    decoder.stdout.emit('data', jpeg);
+    decoder.complete(0);
+    assert.equal(await snapshot, true);
+    assert.deepEqual(h.files.get('/virtual/camera-tests/BATTERY_snapshot.jpg'), jpeg);
+    assert.deepEqual(camera.images, [['snapshot', 'BATTERY']]);
+    assert.equal(await h.manager.getSession(camera), session);
+    await h.manager.stopStream('BATTERY');
+    const retry = await h.manager.getSession(camera);
+    await flush();
+    assert.notEqual(retry, session);
+    assert.equal(retry.native, false);
+    assert.equal(h.processes.filter((proc) => proc.args.includes('-progress')).length, 1);
+    assert.deepEqual(h.calls.filter(([type]) => type === 'native-start'), [['native-start', 'BATTERY']]);
+});
+
+test('a snapshot opened first retains working battery NAS and shares the checked native session', async (t) => {
+    const h = harness(t);
+    const camera = h.camera('BATTERY', 'HOMEBASE', { native: true, battery: true,
+        values: { [PropertyName.DeviceRTSPStreamUrl]: 'rtsp://fixture-camera/live' } });
+    const snapshot = h.manager.requestSnapshot(camera);
+    const concurrent = h.manager.getSession(camera);
+    await flush();
+    assert.equal(h.processes.length, 1);
+    h.processes[0].stdout.emit('data', Buffer.from('frame=1\n'));
+    h.processes[0].complete(0);
+    const session = await concurrent;
+    await flush();
+    assert.equal(session.native, true);
+    assert.equal(h.manager.sessions.size, 1);
+    assert.equal(h.manager.p2pFallback.size, 0);
+    assert.equal(h.manager.stationOwners.size, 0);
+    assert.equal(h.calls.some(([type]) => type === 'start'), false);
+    const mux = h.processes.find((proc) => proc.args.includes('mpegts'));
+    assert.equal(mux.args.includes('-rtsp_transport'), true);
+    assert.equal(mux.args[mux.args.indexOf('-c:v') + 1], 'copy');
+    mux.stdout.emit('data', transportPackets());
+    await flush();
+    const decoder = h.processes.find((proc) => proc.args.includes('image2pipe'));
+    decoder.stdout.emit('data', Buffer.from([0xff, 0xd8, 7, 0xff, 0xd9]));
+    decoder.complete(0);
+    assert.equal(await snapshot, true);
+    assert.equal(await h.manager.getSession(camera), session);
+    assert.equal(h.processes.filter((proc) => proc.args.includes('-progress')).length, 1);
+});
+
+test('Stop during a snapshot-first NAS check cannot open a late source or publish an image', async (t) => {
+    const h = harness(t);
+    const camera = h.camera('BATTERY', 'HOMEBASE', { native: true, battery: true,
+        values: { [PropertyName.DeviceRTSPStreamUrl]: 'rtsp://fixture-camera/live' } });
+    const snapshot = h.manager.requestSnapshot(camera);
+    const rejected = assert.rejects(snapshot, /stopped|cancel/i);
+    await flush();
+    const probe = h.processes[0];
+    await h.manager.stopStream('BATTERY');
+    await rejected;
+    probe.stdout.emit('data', Buffer.from('frame=1\n'));
+    probe.complete(0);
+    await flush();
+    assert.equal(h.manager.sessions.size, 0);
+    assert.equal(h.manager.stationOwners.size, 0);
+    assert.equal(h.manager.p2pFallback.size, 0);
+    assert.equal(h.manager.snapshots.size, 0);
+    assert.equal(h.calls.some(([type]) => type === 'start'), false);
+    assert.equal(h.processes.length, 1);
+    assert.equal(h.files.size, 0);
+    assert.equal(camera.images.length, 0);
+});
+
 test('unreported camera privacy and a disconnected P2P client cannot start a source', async t => {
     const h = harness(t);
     await assert.rejects(h.manager.getSession(h.camera('UNKNOWN', 'STATION', { values: { enabled: undefined } })), /privacy state/i);

@@ -1,4 +1,7 @@
 {
+  "3.44.3": {
+    "en": "Use the same battery-camera NAS fallback for snapshots taken before opening Live View."
+  },
   "3.44.2": {
     "en": "Check battery-camera NAS media readiness and fall back to Eufy P2P without interrupting another camera on the same HomeBase."
   },
