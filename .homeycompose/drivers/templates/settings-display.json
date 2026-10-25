@@ -1,0 +1,52 @@
+{
+  "settings": [
+    {
+      "type": "group",
+      "label": {
+        "en": "Display information"
+      },
+      "children": [
+        {
+          "id": "MODEL",
+          "type": "label",
+          "label": {
+            "en": "Model"
+          },
+          "value": ""
+        },
+        {
+          "id": "FIRMWARE_VERSION",
+          "type": "label",
+          "label": {
+            "en": "Firmware version"
+          },
+          "value": ""
+        },
+        {
+          "id": "HARDWARE_VERSION",
+          "type": "label",
+          "label": {
+            "en": "Hardware version"
+          },
+          "value": ""
+        },
+        {
+          "id": "DEVICE_SN",
+          "type": "label",
+          "label": {
+            "en": "Display S/N"
+          },
+          "value": ""
+        },
+        {
+          "id": "STATION_SN",
+          "type": "label",
+          "label": {
+            "en": "Station S/N"
+          },
+          "value": ""
+        }
+      ]
+    }
+  ]
+}

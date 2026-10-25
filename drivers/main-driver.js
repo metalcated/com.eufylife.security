@@ -18,6 +18,10 @@ module.exports = class mainDriver extends Homey.Driver {
         return 'devices';
     }
 
+    matchesDevice(device) {
+        return this.deviceType().some((model) => device.rawDevice.device_sn.includes(model));
+    }
+
     async onPair(session) {
         this.type = 'pair';
         this.setPairingSession(session);
@@ -202,8 +206,6 @@ module.exports = class mainDriver extends Homey.Driver {
     // ---------------------------------------AUTO COMPLETE HELPERS----------------------------------------------------------
     async onDeviceListRequest(driverId) {
         try {
-            const deviceType = this.deviceType();
-
             const deviceList = await this.homey.app.deviceList;
             const pairedDevicesArray = deviceList.map((device) => {
                 const data = device.getData();
@@ -215,7 +217,7 @@ module.exports = class mainDriver extends Homey.Driver {
 
             const results = this.deviceList
                 .filter((device) => !pairedDevicesArray.includes(device.rawDevice.device_sn))
-                .filter((device) => deviceType.some((v) => device.rawDevice.device_sn.includes(v)))
+                .filter((device) => this.matchesDevice(device))
                 .map((d, i) => ({
                     name: d.rawDevice.device_name,
                     data: {

@@ -1,0 +1,36 @@
+{
+  "settings": [
+    {
+      "type": "group",
+      "label": {
+        "en": "Connection details"
+      },
+      "children": [
+        {
+          "id": "STATION_SN",
+          "type": "label",
+          "label": {
+            "en": "Station S/N"
+          },
+          "value": ""
+        },
+        {
+          "id": "DEVICE_SN",
+          "type": "label",
+          "label": {
+            "en": "Lock S/N"
+          },
+          "value": ""
+        },
+        {
+          "id": "LOCAL_STATION_IP",
+          "type": "label",
+          "label": {
+            "en": "Station IP"
+          },
+          "value": ""
+        }
+      ]
+    }
+  ]
+}

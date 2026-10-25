@@ -1,7 +1,7 @@
 {
   "_comment": "This file is generated. Please edit .homeycompose/app.json instead.",
   "id": "com.eufylife.security",
-  "version": "3.42.8",
+  "version": "3.43.0",
   "compatibility": ">=5.0.0",
   "sdk": 3,
   "brandColor": "#2a6185",
@@ -32002,6 +32002,1140 @@
         "NTFY_VEHICLE_DETECTED"
       ],
       "id": "driver_WALLLIGHT_CAM_S"
+    },
+    {
+      "icon": "/drivers/driver_SMART_LOCK/assets/icon.svg",
+      "images": {
+        "small": "/assets/images/small.jpg",
+        "large": "/assets/images/large.jpg"
+      },
+      "connectivity": [
+        "cloud"
+      ],
+      "platforms": [
+        "local"
+      ],
+      "capabilitiesOptions": {
+        "alarm_motion": {
+          "title": {
+            "en": "Any event (motion / person / etc.)",
+            "nl": "Elk event (beweging / persoon / etc.)",
+            "de": "Jedes Ereignis (Bewegung / Person / etc.)",
+            "fr": "Tout événement (mouvement / personne / etc.)",
+            "it": "Qualsiasi evento (movimento / persona / ecc.)",
+            "sv": "Vilket evenemang (rörelse / person / etc.)",
+            "no": "Enhver hendelse (bevegelse / person / osv.)",
+            "es": "Cualquier evento (movimiento / persona / etc.)",
+            "da": "Enhver begivenhed (bevægelse / person / osv.)",
+            "ru": "Любое событие (движение / человек / и т.д.)",
+            "pl": "Dowolne wydarzenie (ruch / osoba / itp.)"
+          }
+        }
+      },
+      "pair": [
+        {
+          "id": "login_eufy",
+          "options": {
+            "logo": "../../../assets/icon.svg",
+            "title": {
+              "en": "Login with your Eufy account",
+              "da": "Log ind med din Eufy-konto",
+              "de": "Mit Deinem Eufy-Konto anmelden",
+              "es": "Inicia sesión con tu cuenta de Eufy",
+              "it": "Accedi con il tuo account Eufy",
+              "no": "Logg inn med din Eufy-konto",
+              "sv": "Logga in med ditt Eufy-konto",
+              "pl": "Zaloguj się na swoje konto Eufy",
+              "ru": "Войти с аккаунтом Eufy",
+              "ko": "Eufy 계정으로 로그인"
+            },
+            "usernameLabel": {
+              "en": "E-mail address",
+              "nl": "E-mail adres (Gebruik een extra Eufy admin account)",
+              "fr": "Adresse Email - (Utiliser un compte administrateur Eufy supplémentaire)",
+              "da": "E-mail adresse",
+              "de": "E-Mail-Adresse",
+              "es": "Dirección de correo electrónico",
+              "it": "Indirizzo e-mail",
+              "no": "E-postadresse",
+              "sv": "E-postadress",
+              "pl": "Adres e-mail",
+              "ru": "Электронный адрес",
+              "ko": "이메일 주소"
+            },
+            "usernamePlaceholder": {
+              "en": "john@doe.com",
+              "nl": "john@doe.com",
+              "fr": "john@doe.com",
+              "da": "john@doe.com",
+              "de": "john@doe.com",
+              "es": "john@doe.com",
+              "it": "john@doe.com",
+              "no": "john@doe.com",
+              "sv": "john@doe.com",
+              "pl": "john@doe.com",
+              "ru": "john@doe.com",
+              "ko": "john@doe.com"
+            },
+            "passwordLabel": {
+              "en": "Password",
+              "nl": "Wachtwoord",
+              "fr": "Mot de passe",
+              "da": "Adgangskode",
+              "de": "Passwort",
+              "es": "Contraseña",
+              "it": "Password",
+              "no": "Passord",
+              "sv": "Lösenord",
+              "pl": "Hasło",
+              "ru": "Пароль",
+              "ko": "비밀번호"
+            },
+            "passwordPlaceholder": {
+              "en": "Password",
+              "nl": "Wachtwoord",
+              "fr": "Mot de passe",
+              "da": "Adgangskode",
+              "de": "Passwort",
+              "es": "Contraseña",
+              "it": "Password",
+              "no": "Passord",
+              "sv": "Lösenord",
+              "pl": "Hasło",
+              "ru": "Пароль",
+              "ko": "비밀번호"
+            },
+            "buttonText": {
+              "en": "Login",
+              "nl": "Inloggen",
+              "fr": "Utilisateur",
+              "da": "Log ind",
+              "de": "Anmelden",
+              "es": "Iniciar sesión",
+              "it": "Accedi",
+              "no": "Logg inn",
+              "sv": "Logga in",
+              "pl": "Zaloguj się",
+              "ru": "Войти",
+              "ko": "로그인"
+            },
+            "radioGroup": {
+              "en": "Region",
+              "nl": "Regio",
+              "fr": "Région",
+              "da": "Region",
+              "de": "Region",
+              "es": "Región",
+              "it": "Regione",
+              "no": "Region",
+              "sv": "Region",
+              "pl": "Region",
+              "ru": "Регион",
+              "ko": "지역"
+            }
+          }
+        },
+        {
+          "id": "loading",
+          "template": "loading"
+        },
+        {
+          "id": "login_captcha",
+          "options": {
+            "title": {
+              "en": "Captcha required",
+              "nl": "Captcha vereist",
+              "fr": "Captcha nécessaire",
+              "da": "Captcha påkrævet",
+              "de": "Captcha erforderlich",
+              "es": "Captcha requerido",
+              "it": "Captcha richiesto",
+              "no": "Captcha kreves",
+              "sv": "Captcha krävs",
+              "pl": "Captcha wymagana",
+              "ru": "Требуется Captcha",
+              "ko": "캡차 필요"
+            },
+            "captchaLabel": {
+              "en": "Captcha",
+              "nl": "Captcha",
+              "fr": "Captcha",
+              "da": "Captcha",
+              "de": "Captcha",
+              "es": "Captcha",
+              "it": "Captcha",
+              "no": "Captcha",
+              "sv": "Captcha",
+              "pl": "Captcha",
+              "ru": "Captcha",
+              "ko": "캡차"
+            },
+            "captchaPlaceholder": {
+              "en": "A7cF",
+              "nl": "A7cF",
+              "fr": "A7cF",
+              "da": "A7cF",
+              "de": "A7cF",
+              "es": "A7cF",
+              "it": "A7cF",
+              "no": "A7cF",
+              "sv": "A7cF",
+              "pl": "A7cF",
+              "ru": "A7cF",
+              "ko": "A7cF"
+            },
+            "buttonText": {
+              "en": "Login",
+              "nl": "Inloggen",
+              "fr": "Utilisateur",
+              "da": "Log ind",
+              "de": "Anmelden",
+              "es": "Iniciar sesión",
+              "it": "Accedi",
+              "no": "Logg inn",
+              "sv": "Logga in",
+              "pl": "Zaloguj się",
+              "ru": "Войти",
+              "ko": "로그인"
+            }
+          }
+        },
+        {
+          "id": "loading",
+          "template": "loading"
+        },
+        {
+          "id": "pincode",
+          "template": "pincode",
+          "options": {
+            "title": {
+              "en": "Enter 2FA Code",
+              "nl": "Voer 2FA Code in:",
+              "fr": "Entrez votre code 2FA",
+              "da": "Indtast 2FA-kode",
+              "de": "2FA-Code eingeben",
+              "es": "Introduce el código 2FA",
+              "it": "Inserisci il codice 2FA",
+              "no": "Skriv inn 2FA-kode",
+              "sv": "Ange 2FA-kod",
+              "pl": "Wpisz kod 2FA",
+              "ru": "Введите код 2FA",
+              "ko": "2FA 코드 입력"
+            },
+            "type": "number",
+            "length": 6
+          },
+          "navigation": {
+            "prev": "login_eufy"
+          }
+        },
+        {
+          "id": "loading",
+          "template": "loading"
+        },
+        {
+          "id": "error",
+          "navigation": {
+            "prev": "login_eufy"
+          },
+          "options": {
+            "title": {
+              "en": "Error",
+              "nl": "Error",
+              "fr": "Erreur",
+              "da": "Fejl",
+              "de": "Fehler",
+              "es": "Error",
+              "it": "Errore",
+              "no": "Feil",
+              "sv": "Fel",
+              "pl": "Błąd",
+              "ru": "Ошибка",
+              "ko": "오류"
+            },
+            "text": {
+              "en": "<hr><br><br>To change the login click 'previous'.<hr><br><br>",
+              "nl": "<hr><br><br>Om opnieuw in te loggen, klik 'vorige'.<hr><br><br>",
+              "fr": "<hr><br><br>Pour changer le login, cliquez sur 'précédent'.<hr><br><br>",
+              "da": "<hr><br><br>For at ændre login skal du klikke 'forrige'.<hr><br><br>",
+              "de": "<hr><br><br>Um den Login zu ändern, klicke auf 'zurück'.<hr><br><br>",
+              "es": "<hr><br><br>Para cambiar el inicio de sesión, haz clic en 'anterior'.<hr><br><br>",
+              "it": "<hr><br><br>Per modificare il login, fai clic su 'precedente'.<hr><br><br>",
+              "no": "<hr><br><br>For å endre pålogging, klikk 'forrige'.<hr><br><br>",
+              "sv": "<hr><br><br>För att ändra inloggningen, klicka på 'föregående'.<hr><br><br>",
+              "pl": "<hr><br><br>Aby zmienić login, kliknij 'poprzedni'.<hr><br><br>",
+              "ru": "<hr><br><br>Для изменения входа нажмите 'предыдущий'.<hr><br><br>",
+              "ko": "<hr><br><br>로그인을 변경하려면 '이전'을 클릭하세요.<hr><br><br>"
+            }
+          }
+        },
+        {
+          "id": "done",
+          "template": "done"
+        },
+        {
+          "id": "list_devices",
+          "template": "list_devices",
+          "navigation": {
+            "next": "add_devices"
+          }
+        },
+        {
+          "id": "add_devices",
+          "template": "add_devices"
+        },
+        {
+          "id": "done",
+          "template": "done"
+        }
+      ],
+      "repair": [
+        {
+          "id": "login_eufy",
+          "options": {
+            "logo": "../../../assets/icon.svg",
+            "title": {
+              "en": "Login with your Eufy account",
+              "da": "Log ind med din Eufy konto",
+              "de": "Melde dich mit deinem Eufy-Konto an",
+              "es": "Inicia sesión con tu cuenta de Eufy",
+              "it": "Accedi con il tuo account Eufy",
+              "no": "Logg inn med din Eufy-konto",
+              "sv": "Logga in med ditt Eufy-konto",
+              "pl": "Zaloguj się za pomocą konta Eufy",
+              "ru": "Войдите в свою учетную запись Eufy",
+              "ko": "Eufy 계정으로 로그인하세요"
+            },
+            "usernameLabel": {
+              "en": "E-mail address",
+              "da": "E-mail adresse",
+              "de": "E-Mail-Adresse",
+              "es": "Correo electrónico",
+              "it": "Indirizzo email",
+              "no": "E-postadresse",
+              "sv": "E-postadress",
+              "pl": "Adres e-mail",
+              "ru": "Электронная почта",
+              "ko": "이메일 주소"
+            },
+            "usernamePlaceholder": {
+              "en": "john@doe.com",
+              "da": "john@doe.com",
+              "de": "john@doe.com",
+              "es": "john@doe.com",
+              "it": "john@doe.com",
+              "no": "john@doe.com",
+              "sv": "john@doe.com",
+              "pl": "john@doe.com",
+              "ru": "john@doe.com",
+              "ko": "john@doe.com"
+            },
+            "passwordLabel": {
+              "en": "Password",
+              "da": "Adgangskode",
+              "de": "Passwort",
+              "es": "Contraseña",
+              "it": "Password",
+              "no": "Passord",
+              "sv": "Lösenord",
+              "pl": "Hasło",
+              "ru": "Пароль",
+              "ko": "비밀번호"
+            },
+            "passwordPlaceholder": {
+              "en": "Password",
+              "da": "Adgangskode",
+              "de": "Passwort",
+              "es": "Contraseña",
+              "it": "Password",
+              "no": "Passord",
+              "sv": "Lösenord",
+              "pl": "Hasło",
+              "ru": "Пароль",
+              "ko": "비밀번호"
+            },
+            "buttonText": {
+              "en": "Login",
+              "da": "Log ind",
+              "de": "Anmelden",
+              "es": "Iniciar sesión",
+              "it": "Accedi",
+              "no": "Logg inn",
+              "sv": "Logga in",
+              "pl": "Zaloguj się",
+              "ru": "Войти",
+              "ko": "로그인"
+            },
+            "radioGroup": {
+              "en": "Region",
+              "da": "Region",
+              "de": "Region",
+              "es": "Región",
+              "it": "Regione",
+              "no": "Region",
+              "sv": "Region",
+              "pl": "Region",
+              "ru": "Регион",
+              "ko": "지역"
+            }
+          }
+        },
+        {
+          "id": "loading",
+          "template": "loading"
+        },
+        {
+          "id": "login_captcha",
+          "options": {
+            "title": {
+              "en": "Captcha required",
+              "da": "Captcha kræves",
+              "de": "Captcha erforderlich",
+              "es": "Captcha requerido",
+              "it": "Captcha richiesta",
+              "no": "Captcha kreves",
+              "sv": "Captcha krävs",
+              "pl": "Wymagane Captcha",
+              "ru": "Требуется капча",
+              "ko": "캡차 필요"
+            },
+            "captchaLabel": {
+              "en": "Captcha",
+              "da": "Captcha",
+              "de": "Captcha",
+              "es": "Captcha",
+              "it": "Captcha",
+              "no": "Captcha",
+              "sv": "Captcha",
+              "pl": "Captcha",
+              "ru": "Captcha",
+              "ko": "Captcha"
+            },
+            "captchaPlaceholder": {
+              "en": "A7cF",
+              "da": "A7cF",
+              "de": "A7cF",
+              "es": "A7cF",
+              "it": "A7cF",
+              "no": "A7cF",
+              "sv": "A7cF",
+              "pl": "A7cF",
+              "ru": "A7cF",
+              "ko": "A7cF"
+            },
+            "buttonText": {
+              "en": "Login",
+              "da": "Log ind",
+              "de": "Anmelden",
+              "es": "Iniciar sesión",
+              "it": "Accedi",
+              "no": "Logg inn",
+              "sv": "Logga in",
+              "pl": "Zaloguj się",
+              "ru": "Войти",
+              "ko": "로그인"
+            }
+          }
+        },
+        {
+          "id": "loading",
+          "template": "loading"
+        },
+        {
+          "id": "pincode",
+          "template": "pincode",
+          "options": {
+            "title": {
+              "en": "Enter 2FA Code",
+              "da": "Indtast 2FA kode",
+              "de": "2FA-Code eingeben",
+              "es": "Introduce el código 2FA",
+              "it": "Inserisci il codice 2FA",
+              "no": "Skriv inn 2FA-kode",
+              "sv": "Ange 2FA-kod",
+              "pl": "Wprowadź kod 2FA",
+              "ru": "Введите код 2FA",
+              "ko": "2FA 코드를 입력하세요"
+            },
+            "type": "number",
+            "length": 6
+          },
+          "navigation": {
+            "prev": "login_eufy"
+          }
+        },
+        {
+          "id": "loading",
+          "template": "loading"
+        },
+        {
+          "id": "error",
+          "navigation": {
+            "prev": "login_eufy"
+          },
+          "options": {
+            "title": {
+              "en": "Error",
+              "da": "Fejl",
+              "de": "Fehler",
+              "es": "Error",
+              "it": "Errore",
+              "no": "Feil",
+              "sv": "Fel",
+              "pl": "Błąd",
+              "ru": "Ошибка",
+              "ko": "오류"
+            },
+            "text": {
+              "en": "<hr><br><br>To change the login click 'previous'.<hr><br><br>",
+              "da": "<hr><br><br>For at ændre login, klik 'forrige'.<hr><br><br>",
+              "de": "<hr><br><br>Um die Anmeldung zu ändern, klicke auf 'vorherige'.<hr><br><br>",
+              "es": "<hr><br><br>Para cambiar el inicio de sesión haga clic en 'anterior'.<hr><br><br>",
+              "it": "<hr><br><br>Per cambiare il login clicca su 'precedente'.<hr><br><br>",
+              "no": "<hr><br><br>For å endre påloggingen, klikk 'forrige'.<hr><br><br>",
+              "sv": "<hr><br><br>För att ändra inloggningen, klicka på 'föregående'.<hr><br><br>",
+              "pl": "<hr><br><br>Aby zmienić logowanie, kliknij 'poprzedni'.<hr><br><br>",
+              "ru": "<hr><br><br>Чтобы изменить вход, нажмите 'предыдущий'.<hr><br><br>",
+              "ko": "<hr><br><br>로그인을 변경하려면 '이전'을 클릭하세요.<hr><br><br>"
+            }
+          }
+        },
+        {
+          "id": "done",
+          "template": "done"
+        },
+        {
+          "id": "list_devices",
+          "template": "list_devices",
+          "navigation": {
+            "next": "add_devices"
+          }
+        },
+        {
+          "id": "add_devices",
+          "template": "add_devices"
+        },
+        {
+          "id": "done",
+          "template": "done"
+        }
+      ],
+      "settings": [
+        {
+          "type": "group",
+          "label": {
+            "en": "Connection details"
+          },
+          "children": [
+            {
+              "id": "STATION_SN",
+              "type": "label",
+              "label": {
+                "en": "Station S/N"
+              },
+              "value": ""
+            },
+            {
+              "id": "DEVICE_SN",
+              "type": "label",
+              "label": {
+                "en": "Lock S/N"
+              },
+              "value": ""
+            },
+            {
+              "id": "LOCAL_STATION_IP",
+              "type": "label",
+              "label": {
+                "en": "Station IP"
+              },
+              "value": ""
+            }
+          ]
+        }
+      ],
+      "name": {
+        "en": "Smart Lock"
+      },
+      "class": "lock",
+      "capabilities": [
+        "locked"
+      ],
+      "id": "driver_SMART_LOCK"
+    },
+    {
+      "icon": "/drivers/driver_SMART_DISPLAY/assets/icon.svg",
+      "images": {
+        "small": "/assets/images/small.jpg",
+        "large": "/assets/images/large.jpg"
+      },
+      "connectivity": [
+        "cloud"
+      ],
+      "platforms": [
+        "local"
+      ],
+      "capabilitiesOptions": {
+        "alarm_motion": {
+          "title": {
+            "en": "Any event (motion / person / etc.)",
+            "nl": "Elk event (beweging / persoon / etc.)",
+            "de": "Jedes Ereignis (Bewegung / Person / etc.)",
+            "fr": "Tout événement (mouvement / personne / etc.)",
+            "it": "Qualsiasi evento (movimento / persona / ecc.)",
+            "sv": "Vilket evenemang (rörelse / person / etc.)",
+            "no": "Enhver hendelse (bevegelse / person / osv.)",
+            "es": "Cualquier evento (movimiento / persona / etc.)",
+            "da": "Enhver begivenhed (bevægelse / person / osv.)",
+            "ru": "Любое событие (движение / человек / и т.д.)",
+            "pl": "Dowolne wydarzenie (ruch / osoba / itp.)"
+          }
+        }
+      },
+      "pair": [
+        {
+          "id": "login_eufy",
+          "options": {
+            "logo": "../../../assets/icon.svg",
+            "title": {
+              "en": "Login with your Eufy account",
+              "da": "Log ind med din Eufy-konto",
+              "de": "Mit Deinem Eufy-Konto anmelden",
+              "es": "Inicia sesión con tu cuenta de Eufy",
+              "it": "Accedi con il tuo account Eufy",
+              "no": "Logg inn med din Eufy-konto",
+              "sv": "Logga in med ditt Eufy-konto",
+              "pl": "Zaloguj się na swoje konto Eufy",
+              "ru": "Войти с аккаунтом Eufy",
+              "ko": "Eufy 계정으로 로그인"
+            },
+            "usernameLabel": {
+              "en": "E-mail address",
+              "nl": "E-mail adres (Gebruik een extra Eufy admin account)",
+              "fr": "Adresse Email - (Utiliser un compte administrateur Eufy supplémentaire)",
+              "da": "E-mail adresse",
+              "de": "E-Mail-Adresse",
+              "es": "Dirección de correo electrónico",
+              "it": "Indirizzo e-mail",
+              "no": "E-postadresse",
+              "sv": "E-postadress",
+              "pl": "Adres e-mail",
+              "ru": "Электронный адрес",
+              "ko": "이메일 주소"
+            },
+            "usernamePlaceholder": {
+              "en": "john@doe.com",
+              "nl": "john@doe.com",
+              "fr": "john@doe.com",
+              "da": "john@doe.com",
+              "de": "john@doe.com",
+              "es": "john@doe.com",
+              "it": "john@doe.com",
+              "no": "john@doe.com",
+              "sv": "john@doe.com",
+              "pl": "john@doe.com",
+              "ru": "john@doe.com",
+              "ko": "john@doe.com"
+            },
+            "passwordLabel": {
+              "en": "Password",
+              "nl": "Wachtwoord",
+              "fr": "Mot de passe",
+              "da": "Adgangskode",
+              "de": "Passwort",
+              "es": "Contraseña",
+              "it": "Password",
+              "no": "Passord",
+              "sv": "Lösenord",
+              "pl": "Hasło",
+              "ru": "Пароль",
+              "ko": "비밀번호"
+            },
+            "passwordPlaceholder": {
+              "en": "Password",
+              "nl": "Wachtwoord",
+              "fr": "Mot de passe",
+              "da": "Adgangskode",
+              "de": "Passwort",
+              "es": "Contraseña",
+              "it": "Password",
+              "no": "Passord",
+              "sv": "Lösenord",
+              "pl": "Hasło",
+              "ru": "Пароль",
+              "ko": "비밀번호"
+            },
+            "buttonText": {
+              "en": "Login",
+              "nl": "Inloggen",
+              "fr": "Utilisateur",
+              "da": "Log ind",
+              "de": "Anmelden",
+              "es": "Iniciar sesión",
+              "it": "Accedi",
+              "no": "Logg inn",
+              "sv": "Logga in",
+              "pl": "Zaloguj się",
+              "ru": "Войти",
+              "ko": "로그인"
+            },
+            "radioGroup": {
+              "en": "Region",
+              "nl": "Regio",
+              "fr": "Région",
+              "da": "Region",
+              "de": "Region",
+              "es": "Región",
+              "it": "Regione",
+              "no": "Region",
+              "sv": "Region",
+              "pl": "Region",
+              "ru": "Регион",
+              "ko": "지역"
+            }
+          }
+        },
+        {
+          "id": "loading",
+          "template": "loading"
+        },
+        {
+          "id": "login_captcha",
+          "options": {
+            "title": {
+              "en": "Captcha required",
+              "nl": "Captcha vereist",
+              "fr": "Captcha nécessaire",
+              "da": "Captcha påkrævet",
+              "de": "Captcha erforderlich",
+              "es": "Captcha requerido",
+              "it": "Captcha richiesto",
+              "no": "Captcha kreves",
+              "sv": "Captcha krävs",
+              "pl": "Captcha wymagana",
+              "ru": "Требуется Captcha",
+              "ko": "캡차 필요"
+            },
+            "captchaLabel": {
+              "en": "Captcha",
+              "nl": "Captcha",
+              "fr": "Captcha",
+              "da": "Captcha",
+              "de": "Captcha",
+              "es": "Captcha",
+              "it": "Captcha",
+              "no": "Captcha",
+              "sv": "Captcha",
+              "pl": "Captcha",
+              "ru": "Captcha",
+              "ko": "캡차"
+            },
+            "captchaPlaceholder": {
+              "en": "A7cF",
+              "nl": "A7cF",
+              "fr": "A7cF",
+              "da": "A7cF",
+              "de": "A7cF",
+              "es": "A7cF",
+              "it": "A7cF",
+              "no": "A7cF",
+              "sv": "A7cF",
+              "pl": "A7cF",
+              "ru": "A7cF",
+              "ko": "A7cF"
+            },
+            "buttonText": {
+              "en": "Login",
+              "nl": "Inloggen",
+              "fr": "Utilisateur",
+              "da": "Log ind",
+              "de": "Anmelden",
+              "es": "Iniciar sesión",
+              "it": "Accedi",
+              "no": "Logg inn",
+              "sv": "Logga in",
+              "pl": "Zaloguj się",
+              "ru": "Войти",
+              "ko": "로그인"
+            }
+          }
+        },
+        {
+          "id": "loading",
+          "template": "loading"
+        },
+        {
+          "id": "pincode",
+          "template": "pincode",
+          "options": {
+            "title": {
+              "en": "Enter 2FA Code",
+              "nl": "Voer 2FA Code in:",
+              "fr": "Entrez votre code 2FA",
+              "da": "Indtast 2FA-kode",
+              "de": "2FA-Code eingeben",
+              "es": "Introduce el código 2FA",
+              "it": "Inserisci il codice 2FA",
+              "no": "Skriv inn 2FA-kode",
+              "sv": "Ange 2FA-kod",
+              "pl": "Wpisz kod 2FA",
+              "ru": "Введите код 2FA",
+              "ko": "2FA 코드 입력"
+            },
+            "type": "number",
+            "length": 6
+          },
+          "navigation": {
+            "prev": "login_eufy"
+          }
+        },
+        {
+          "id": "loading",
+          "template": "loading"
+        },
+        {
+          "id": "error",
+          "navigation": {
+            "prev": "login_eufy"
+          },
+          "options": {
+            "title": {
+              "en": "Error",
+              "nl": "Error",
+              "fr": "Erreur",
+              "da": "Fejl",
+              "de": "Fehler",
+              "es": "Error",
+              "it": "Errore",
+              "no": "Feil",
+              "sv": "Fel",
+              "pl": "Błąd",
+              "ru": "Ошибка",
+              "ko": "오류"
+            },
+            "text": {
+              "en": "<hr><br><br>To change the login click 'previous'.<hr><br><br>",
+              "nl": "<hr><br><br>Om opnieuw in te loggen, klik 'vorige'.<hr><br><br>",
+              "fr": "<hr><br><br>Pour changer le login, cliquez sur 'précédent'.<hr><br><br>",
+              "da": "<hr><br><br>For at ændre login skal du klikke 'forrige'.<hr><br><br>",
+              "de": "<hr><br><br>Um den Login zu ändern, klicke auf 'zurück'.<hr><br><br>",
+              "es": "<hr><br><br>Para cambiar el inicio de sesión, haz clic en 'anterior'.<hr><br><br>",
+              "it": "<hr><br><br>Per modificare il login, fai clic su 'precedente'.<hr><br><br>",
+              "no": "<hr><br><br>For å endre pålogging, klikk 'forrige'.<hr><br><br>",
+              "sv": "<hr><br><br>För att ändra inloggningen, klicka på 'föregående'.<hr><br><br>",
+              "pl": "<hr><br><br>Aby zmienić login, kliknij 'poprzedni'.<hr><br><br>",
+              "ru": "<hr><br><br>Для изменения входа нажмите 'предыдущий'.<hr><br><br>",
+              "ko": "<hr><br><br>로그인을 변경하려면 '이전'을 클릭하세요.<hr><br><br>"
+            }
+          }
+        },
+        {
+          "id": "done",
+          "template": "done"
+        },
+        {
+          "id": "list_devices",
+          "template": "list_devices",
+          "navigation": {
+            "next": "add_devices"
+          }
+        },
+        {
+          "id": "add_devices",
+          "template": "add_devices"
+        },
+        {
+          "id": "done",
+          "template": "done"
+        }
+      ],
+      "repair": [
+        {
+          "id": "login_eufy",
+          "options": {
+            "logo": "../../../assets/icon.svg",
+            "title": {
+              "en": "Login with your Eufy account",
+              "da": "Log ind med din Eufy konto",
+              "de": "Melde dich mit deinem Eufy-Konto an",
+              "es": "Inicia sesión con tu cuenta de Eufy",
+              "it": "Accedi con il tuo account Eufy",
+              "no": "Logg inn med din Eufy-konto",
+              "sv": "Logga in med ditt Eufy-konto",
+              "pl": "Zaloguj się za pomocą konta Eufy",
+              "ru": "Войдите в свою учетную запись Eufy",
+              "ko": "Eufy 계정으로 로그인하세요"
+            },
+            "usernameLabel": {
+              "en": "E-mail address",
+              "da": "E-mail adresse",
+              "de": "E-Mail-Adresse",
+              "es": "Correo electrónico",
+              "it": "Indirizzo email",
+              "no": "E-postadresse",
+              "sv": "E-postadress",
+              "pl": "Adres e-mail",
+              "ru": "Электронная почта",
+              "ko": "이메일 주소"
+            },
+            "usernamePlaceholder": {
+              "en": "john@doe.com",
+              "da": "john@doe.com",
+              "de": "john@doe.com",
+              "es": "john@doe.com",
+              "it": "john@doe.com",
+              "no": "john@doe.com",
+              "sv": "john@doe.com",
+              "pl": "john@doe.com",
+              "ru": "john@doe.com",
+              "ko": "john@doe.com"
+            },
+            "passwordLabel": {
+              "en": "Password",
+              "da": "Adgangskode",
+              "de": "Passwort",
+              "es": "Contraseña",
+              "it": "Password",
+              "no": "Passord",
+              "sv": "Lösenord",
+              "pl": "Hasło",
+              "ru": "Пароль",
+              "ko": "비밀번호"
+            },
+            "passwordPlaceholder": {
+              "en": "Password",
+              "da": "Adgangskode",
+              "de": "Passwort",
+              "es": "Contraseña",
+              "it": "Password",
+              "no": "Passord",
+              "sv": "Lösenord",
+              "pl": "Hasło",
+              "ru": "Пароль",
+              "ko": "비밀번호"
+            },
+            "buttonText": {
+              "en": "Login",
+              "da": "Log ind",
+              "de": "Anmelden",
+              "es": "Iniciar sesión",
+              "it": "Accedi",
+              "no": "Logg inn",
+              "sv": "Logga in",
+              "pl": "Zaloguj się",
+              "ru": "Войти",
+              "ko": "로그인"
+            },
+            "radioGroup": {
+              "en": "Region",
+              "da": "Region",
+              "de": "Region",
+              "es": "Región",
+              "it": "Regione",
+              "no": "Region",
+              "sv": "Region",
+              "pl": "Region",
+              "ru": "Регион",
+              "ko": "지역"
+            }
+          }
+        },
+        {
+          "id": "loading",
+          "template": "loading"
+        },
+        {
+          "id": "login_captcha",
+          "options": {
+            "title": {
+              "en": "Captcha required",
+              "da": "Captcha kræves",
+              "de": "Captcha erforderlich",
+              "es": "Captcha requerido",
+              "it": "Captcha richiesta",
+              "no": "Captcha kreves",
+              "sv": "Captcha krävs",
+              "pl": "Wymagane Captcha",
+              "ru": "Требуется капча",
+              "ko": "캡차 필요"
+            },
+            "captchaLabel": {
+              "en": "Captcha",
+              "da": "Captcha",
+              "de": "Captcha",
+              "es": "Captcha",
+              "it": "Captcha",
+              "no": "Captcha",
+              "sv": "Captcha",
+              "pl": "Captcha",
+              "ru": "Captcha",
+              "ko": "Captcha"
+            },
+            "captchaPlaceholder": {
+              "en": "A7cF",
+              "da": "A7cF",
+              "de": "A7cF",
+              "es": "A7cF",
+              "it": "A7cF",
+              "no": "A7cF",
+              "sv": "A7cF",
+              "pl": "A7cF",
+              "ru": "A7cF",
+              "ko": "A7cF"
+            },
+            "buttonText": {
+              "en": "Login",
+              "da": "Log ind",
+              "de": "Anmelden",
+              "es": "Iniciar sesión",
+              "it": "Accedi",
+              "no": "Logg inn",
+              "sv": "Logga in",
+              "pl": "Zaloguj się",
+              "ru": "Войти",
+              "ko": "로그인"
+            }
+          }
+        },
+        {
+          "id": "loading",
+          "template": "loading"
+        },
+        {
+          "id": "pincode",
+          "template": "pincode",
+          "options": {
+            "title": {
+              "en": "Enter 2FA Code",
+              "da": "Indtast 2FA kode",
+              "de": "2FA-Code eingeben",
+              "es": "Introduce el código 2FA",
+              "it": "Inserisci il codice 2FA",
+              "no": "Skriv inn 2FA-kode",
+              "sv": "Ange 2FA-kod",
+              "pl": "Wprowadź kod 2FA",
+              "ru": "Введите код 2FA",
+              "ko": "2FA 코드를 입력하세요"
+            },
+            "type": "number",
+            "length": 6
+          },
+          "navigation": {
+            "prev": "login_eufy"
+          }
+        },
+        {
+          "id": "loading",
+          "template": "loading"
+        },
+        {
+          "id": "error",
+          "navigation": {
+            "prev": "login_eufy"
+          },
+          "options": {
+            "title": {
+              "en": "Error",
+              "da": "Fejl",
+              "de": "Fehler",
+              "es": "Error",
+              "it": "Errore",
+              "no": "Feil",
+              "sv": "Fel",
+              "pl": "Błąd",
+              "ru": "Ошибка",
+              "ko": "오류"
+            },
+            "text": {
+              "en": "<hr><br><br>To change the login click 'previous'.<hr><br><br>",
+              "da": "<hr><br><br>For at ændre login, klik 'forrige'.<hr><br><br>",
+              "de": "<hr><br><br>Um die Anmeldung zu ändern, klicke auf 'vorherige'.<hr><br><br>",
+              "es": "<hr><br><br>Para cambiar el inicio de sesión haga clic en 'anterior'.<hr><br><br>",
+              "it": "<hr><br><br>Per cambiare il login clicca su 'precedente'.<hr><br><br>",
+              "no": "<hr><br><br>For å endre påloggingen, klikk 'forrige'.<hr><br><br>",
+              "sv": "<hr><br><br>För att ändra inloggningen, klicka på 'föregående'.<hr><br><br>",
+              "pl": "<hr><br><br>Aby zmienić logowanie, kliknij 'poprzedni'.<hr><br><br>",
+              "ru": "<hr><br><br>Чтобы изменить вход, нажмите 'предыдущий'.<hr><br><br>",
+              "ko": "<hr><br><br>로그인을 변경하려면 '이전'을 클릭하세요.<hr><br><br>"
+            }
+          }
+        },
+        {
+          "id": "done",
+          "template": "done"
+        },
+        {
+          "id": "list_devices",
+          "template": "list_devices",
+          "navigation": {
+            "next": "add_devices"
+          }
+        },
+        {
+          "id": "add_devices",
+          "template": "add_devices"
+        },
+        {
+          "id": "done",
+          "template": "done"
+        }
+      ],
+      "settings": [
+        {
+          "type": "group",
+          "label": {
+            "en": "Display information"
+          },
+          "children": [
+            {
+              "id": "MODEL",
+              "type": "label",
+              "label": {
+                "en": "Model"
+              },
+              "value": ""
+            },
+            {
+              "id": "FIRMWARE_VERSION",
+              "type": "label",
+              "label": {
+                "en": "Firmware version"
+              },
+              "value": ""
+            },
+            {
+              "id": "HARDWARE_VERSION",
+              "type": "label",
+              "label": {
+                "en": "Hardware version"
+              },
+              "value": ""
+            },
+            {
+              "id": "DEVICE_SN",
+              "type": "label",
+              "label": {
+                "en": "Display S/N"
+              },
+              "value": ""
+            },
+            {
+              "id": "STATION_SN",
+              "type": "label",
+              "label": {
+                "en": "Station S/N"
+              },
+              "value": ""
+            }
+          ]
+        }
+      ],
+      "name": {
+        "en": "Smart Display E10"
+      },
+      "class": "other",
+      "capabilities": [],
+      "id": "driver_SMART_DISPLAY"
     }
   ],
   "capabilities": {
