@@ -1,4 +1,7 @@
 {
+  "3.43.3": {
+    "en": "Report safe response structure when smart-display cloud discovery is incomplete."
+  },
   "3.43.2": {
     "en": "Keep smart-display pairing responsive while cloud discovery completes and report safe discovery failure status."
   },

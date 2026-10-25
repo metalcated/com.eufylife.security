@@ -309,12 +309,31 @@ test('discovery failure reasons describe the failing stage without exposing back
             assert.equal(status.attempted, true);
             assert.equal(status.pending, false);
             assert.equal(JSON.stringify(status).includes(secret), false);
-            assert.ok(Object.keys(status).every((key) => ['complete', 'error', 'reason', 'attempted', 'pending', 'updatedAt'].includes(key)));
+            assert.ok(Object.keys(status).every((key) => ['complete', 'error', 'reason', 'responses', 'attempted', 'pending', 'updatedAt'].includes(key)));
         });
     }
     const status = discovery().getStatus(null);
     assert.equal(status.complete, false);
     assert.equal(status.reason, 'client_unavailable');
+});
+
+test('failure diagnostics identify response types without arbitrary keys, response values, or shared mutable state', async () => {
+    const secret = 'private-account-value';
+    const h = clientDouble({ handler: (endpoint) => endpoint === 'house/get_house_list'
+        ? { house_infos: [{ house_id: 42 }] }
+        : { data: [secret], [secret]: secret, devices: secret } });
+    const helper = discovery();
+    await helper.getDevices(h.client);
+    const status = helper.getStatus(h.client);
+    assert.deepEqual(status.responses, [
+        { collection: 'house_infos', scope: 'account', kind: 'object', fieldCount: 1, fields: { house_infos: { kind: 'array', length: 1 } } },
+        { collection: 'house_id', kind: 'number' },
+        { collection: 'devices', scope: 'account', kind: 'object', fieldCount: 3, fields: { devices: { kind: 'string' }, data: { kind: 'array', length: 1 } } }
+    ]);
+    assert.equal(JSON.stringify(status).includes(secret), false);
+    status.responses[0].fields.house_infos.length = 999;
+    assert.equal(helper.getStatus(h.client).responses[0].fields.house_infos.length, 1);
+    await helper.getDevices(clientDouble().client);
 });
 
 test('client replacement cannot reuse another client session cache or inventory', async () => {
