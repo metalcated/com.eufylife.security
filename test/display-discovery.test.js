@@ -84,7 +84,8 @@ test('display discovery queries bare and each house scope, deduplicates E10 reco
         ['/app/house/get_devs_list', { house_id: 'HOUSE1' }],
         ['/app/house/get_devs_list', { house_id: 'HOUSE2' }]
     ]);
-    assert.deepEqual(helper.getStatus(h.client), { complete: true });
+    assert.equal(helper.getStatus(h.client).complete, true);
+    assert.equal(helper.getStatus(h.client).error, undefined);
     assert.equal(h.client.devices, h.cameraRegistry);
     assert.equal(h.cameraRegistry.size, 1);
 });
@@ -252,7 +253,68 @@ test('partial discovery retains prior displays while a complete empty refresh re
     assert.equal(helper.getStatus(h.client).complete, false);
     phase = 'empty';
     assert.deepEqual(await helper.getDevices(h.client, { refresh: true }), [legacy]);
-    assert.deepEqual(helper.getStatus(h.client), { complete: true });
+    assert.equal(helper.getStatus(h.client).complete, true);
+    assert.equal(helper.getStatus(h.client).error, undefined);
+});
+
+test('safe discovery status distinguishes an unattempted lookup, pending request, and completed attempt', async () => {
+    let release;
+    let time = 123;
+    const h = clientDouble({ handler: async (endpoint) => {
+        if (endpoint === 'house/get_house_list') {
+            await new Promise((resolve) => { release = resolve; });
+            return { house_infos: [] };
+        }
+        return { devices: [] };
+    } });
+    const helper = discovery({ now: () => time });
+    const before = helper.getStatus(h.client);
+    assert.equal(before.attempted, false);
+    assert.equal(before.pending, false);
+    const pending = helper.getDevices(h.client);
+    await new Promise(setImmediate);
+    assert.equal(helper.getStatus(h.client).pending, true);
+    time = 456;
+    release();
+    await pending;
+    const completed = helper.getStatus(h.client);
+    assert.equal(completed.attempted, true);
+    assert.equal(completed.pending, false);
+    assert.equal(completed.updatedAt, 456);
+    assert.equal(completed.complete, true);
+    completed.complete = false;
+    assert.equal(helper.getStatus(h.client).complete, true, 'status callers cannot mutate cached state');
+});
+
+test('discovery failure reasons describe the failing stage without exposing backend bodies or credentials', async (t) => {
+    const secret = 'backend-body-account@example.test-private-session';
+    const scenarios = [
+        ['session_missing', (h) => { delete h.client.megaTransition.megaApi; }],
+        ['session_suppressed', (h) => { h.client.megaTransition.megaLoginFailed = true; }],
+        ['unsupported_client', (h) => { delete h.client.megaTransition.megaApi.callDecrypted; }],
+        ['session_invalid', (h) => { h.client.megaTransition.megaApi.hasValidSession = () => false; }],
+        ['unexpected_response', (h) => { h.client.megaTransition.megaApi.callDecrypted = async () => ({ body: secret }); }],
+        ['request_failed', (h) => { h.client.megaTransition.megaApi.callDecrypted = async () => { throw Error(secret); }; }],
+        ['legacy_unavailable', (h) => { h.client.getDevices = async () => { throw Error(secret); }; }]
+    ];
+    for (const [reason, configure] of scenarios) {
+        await t.test(reason, async () => {
+            const h = clientDouble();
+            configure(h);
+            const helper = discovery();
+            await helper.getDevices(h.client);
+            const status = helper.getStatus(h.client);
+            assert.equal(status.complete, false);
+            assert.equal(status.reason, reason);
+            assert.equal(status.attempted, true);
+            assert.equal(status.pending, false);
+            assert.equal(JSON.stringify(status).includes(secret), false);
+            assert.ok(Object.keys(status).every((key) => ['complete', 'error', 'reason', 'attempted', 'pending', 'updatedAt'].includes(key)));
+        });
+    }
+    const status = discovery().getStatus(null);
+    assert.equal(status.complete, false);
+    assert.equal(status.reason, 'client_unavailable');
 });
 
 test('client replacement cannot reuse another client session cache or inventory', async () => {

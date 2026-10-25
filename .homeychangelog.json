@@ -1,4 +1,7 @@
 {
+  "3.43.2": {
+    "en": "Keep smart-display pairing responsive while cloud discovery completes and report safe discovery failure status."
+  },
   "3.43.1": {
     "en": "Discover Smart Display E10 through the existing Eufy Mega session and add a manual information refresh action."
   },

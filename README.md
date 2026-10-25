@@ -94,6 +94,8 @@ Battery level is added only when display parameter 8001 contains a valid percent
 
 The adapter merges the global and house-specific Eufy Mega device lists, because either can omit a display returned by the other. It uses only an already-created valid session and honors the client's failed-login suppression. It does not initiate another login or export credentials. Concurrent queries share a short-lived cache; partial failures retain known display records, and failed manual refreshes preserve the last displayed values while reporting failure. If the existing session is unavailable, repair the Eufy login or retry later. A successful empty inventory can also mean that the Eufy account has no access to the display.
 
+Version 3.43.2 keeps the pairing loading view responsive while display discovery finishes. Completed empty scans stop promptly, and closing or leaving the pairing flow discards late results. Camera and station drivers retain their existing discovery policy. Diagnostic status contains only completion flags, a timestamp, and a safe failure reason.
+
 The [eufy-sdk display research](https://mega-yfue.github.io/smart-display) documents the limited available data; screen brightness, volume, wake, camera-view controls, and firmware installation have no verified command path in the pinned client. These remain managed on the display or in Eufy's app.
 
 ## Validation
