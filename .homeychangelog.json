@@ -1,4 +1,7 @@
 {
+  "3.44.4": {
+    "en": "Stop showing a general migration advisory as a camera fault while preserving device-specific warnings and account notifications."
+  },
   "3.44.3": {
     "en": "Use the same battery-camera NAS fallback for snapshots taken before opening Live View."
   },

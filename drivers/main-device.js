@@ -67,8 +67,6 @@ module.exports = class mainDevice extends Homey.Device {
                 await step(() => this.resetCapabilities());
             }
 
-            await step(() => this.updateRemoteWarning());
-
             const appSettings = this.homey.app.appSettings;
             const ipAddress = appSettings.STATION_IPS[this.HomeyDevice.station_sn] ? appSettings.STATION_IPS[this.HomeyDevice.station_sn] : this.EufyStation.getLANIPAddress();
             await step(() => this.setSettings({
@@ -168,21 +166,6 @@ module.exports = class mainDevice extends Homey.Device {
             this.setUnavailable(`${this.getName()} ${this.homey.__('device.need_captcha')}`);
         } else if (this.homey.app.need2FA) {
             this.setUnavailable(`${this.getName()} ${this.homey.__('device.need_2FA')}`);
-        }
-    }
-
-    async updateRemoteWarning() {
-        try {
-            let warningText = this.homey.app.warningText || [];
-
-            this.unsetWarning();
-
-            if (warningText.length) {
-                this.setWarning(warningText);
-                this.homey.app.log(`[Device] ${this.getName()} - updateRemoteWarning - warningText`, warningText);
-            }
-        } catch (error) {
-            this.homey.app.error(`[Device] ${this.getName()} - updateRemoteWarning - error`, error);
         }
     }
 

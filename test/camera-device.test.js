@@ -25,11 +25,41 @@ function harness() {
         FfmpegManager: { releaseDevice: async id => calls.push(['release', id]) } } };
     device.getName = () => 'Camera'; device.getSettings = () => ({});
     for (const name of ['setImage', 'setVideo', 'checkCapabilities', 'resetCapabilities', 'check_alarm_arm_mode',
-        'check_alarm_generic', 'check_alarm_motion', 'setCapabilitiesListeners', 'setSettings', 'updateRemoteWarning', 'setUnavailable', 'setAvailable']) {
+        'check_alarm_generic', 'check_alarm_motion', 'setCapabilitiesListeners', 'setSettings', 'setUnavailable', 'setAvailable']) {
         device[name] = async (...args) => calls.push([name, ...args]);
     }
     return { device, calls, client, remote, disconnect: () => { connected = false; } };
 }
+
+test('initializing an upgraded camera clears the old broadcast advisory without restoring it', async () => {
+    const h = harness();
+    const advisory = 'Eufy migration can break notifications, images and streaming.';
+    let warning = advisory;
+    h.device.homey.app.warningText = advisory;
+    h.device.driver = { id: 'driver_INDOOR_CAM' };
+    h.device.getData = () => ({ device_sn: 'CAMERA', station_sn: 'STATION' });
+    h.device.setWarning = async value => { warning = value; h.calls.push(['setWarning', value]); };
+    h.device.unsetWarning = async () => { warning = undefined; h.calls.push(['unsetWarning']); };
+    await h.device.setupDevice();
+    await h.device.onStartup(true, 0);
+    assert.equal(h.device._started, true);
+    assert.equal(warning, undefined);
+    assert.equal(h.calls.filter(([name]) => name === 'unsetWarning').length, 1);
+    assert.equal(h.calls.some(([name]) => name === 'setWarning'), false);
+});
+
+test('camera reconnect preserves a real device warning rather than replacing it with a broadcast', async () => {
+    const h = harness();
+    const genuineWarning = 'Camera connection requires attention.';
+    let warning = genuineWarning;
+    h.device.homey.app.warningText = 'Eufy migration advisory';
+    h.device.setWarning = async value => { warning = value; h.calls.push(['setWarning', value]); };
+    h.device.unsetWarning = async () => { warning = undefined; h.calls.push(['unsetWarning']); };
+    await h.device.onStartup(false, 0);
+    assert.equal(h.device._started, true);
+    assert.equal(warning, genuineWarning);
+    assert.equal(h.calls.some(([name]) => name === 'setWarning' || name === 'unsetWarning'), false);
+});
 
 test('a failed camera reconnect clears earlier readiness and cannot expose stale camera objects', async () => {
     const h = harness();

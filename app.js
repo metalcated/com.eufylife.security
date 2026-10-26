@@ -154,8 +154,6 @@ class App extends Homey.App {
         this.needCaptcha = null;
         this.need2FA = null;
 
-        this.warningText = [];
-
         this.homey.settings.getKeys().forEach((key) => {
             if (key == _settingsKey) {
                 this.settingsInitialized = true;
@@ -258,7 +256,6 @@ class App extends Homey.App {
 
     async sendNotifications() {
         try {
-            this.warningText = (await fetchRemoteText('warning.txt')).trim();
             const notificationsText = await fetchRemoteText('notifications.txt');
 
             const notifications = normalizeRemoteLines(notificationsText)
