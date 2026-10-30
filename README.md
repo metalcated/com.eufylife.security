@@ -137,11 +137,13 @@ Physical-device validation remains necessary. After installing on a Homey test i
 
 The 2026-10-30 trial used Homey Self-Hosted 13.5.3 with 8 GiB VM RAM and four vCPUs. The installed app runtime was Node 22.23.4 / OpenSSL 3.5.9, and both Garage and Doorbell reported native video decryption while delivering full-resolution P2P video. Sustained concurrent playback still exceeded Homey's fixed app CPU budget, so the CPU safeguard stopped the private sources while leaving Eufy running. Browser video clocks continued advancing on the final frame; they are not proof that an upstream remains live. Use fresh `/cameras/status` source state and increasing byte counts alongside decoded video when validating playback.
 
-The temporary concurrent rollout was disabled after this trial. Native RTSP and the existing single-connection P2P path remain available. Additional VM memory/CPU did not remove the app watchdog constraints. Concurrent P2P playback is experimental and has not passed sustained live acceptance on this installation; the next design decision is whether to move media processing outside the Homey app or reduce camera stream settings with the owner's approval.
+The in-app concurrent rollout was disabled after this trial. Native RTSP and the existing single-connection P2P path remain available. Additional VM memory/CPU did not remove the app watchdog constraints. The external helper below moves media processing outside the Homey app without changing camera stream settings. Its deployment and recovery checks have passed; sustained concurrent playback on the actual cameras remains a separate acceptance step.
 
-## External media helper (3.45.0)
+## External media helper (3.45.1)
 
 The optional media helper moves selected P2P camera sessions, FFmpeg, and JPEG decoding into a separate Docker container. Homey continues registering the same Eufy-owned camera device and `main` video slot through its supported SDK. Native RTSP retains its direct path. Account credentials and cloud authentication remain in the Eufy app; the helper receives only scoped camera metadata and the bounded read-only handshake responses required for that camera.
+
+App 3.45.1 and helper 0.1.1 add clearer source timing and bounded failure diagnostics. The earlier installation, rollback, restart, and live-camera results below retain the versions actually tested.
 
 The helper binds to `127.0.0.1` on the same Linux VM as Homey. Control requests require its persistent private key; video URLs carry a separate opaque media capability. Neither is exposed by the diagnostic API. An active, current lease is required even when an existing media URL is known. Homey validates camera privacy, paired-device identity, Station identity, client identity, and selected-device scope before supplying keys and renewing a lease. Leases last at most 75 seconds without renewal. Explicit Stop, privacy changes, app epoch changes, and cancellation close the camera independently of its peers. At most four pending, active, or closing relayed sources are reserved across the app and helper; native RTSP bypasses this relay count.
 
@@ -155,7 +157,7 @@ On the VM, place `compose.yaml`, `example.env`, `healthcheck.cjs`, and `manage.p
 
 ```bash
 sudo python3 /opt/homey-eufy-media-helper/manage.py \
-  --image metalcated/homey-eufy-media-helper:0.1.0 \
+  --image metalcated/homey-eufy-media-helper:0.1.1 \
   --image-id sha256:REVIEWED_IMAGE_ID \
   --seed-token /private/path/to/bootstrap.key
 ```
@@ -174,4 +176,22 @@ App/helper protocol version 1 and the pinned Eufy SDK 4.2.6 are negotiated befor
 
 The authenticated Eufy API `GET /camera-helper` reports only configuration, availability, protocol, version, SDK, and instance identity. `GET /cameras/status` refreshes bounded helper status and reports source state and byte counts without keys, cloud records, or media URLs. Increasing byte counts and successful decoding are the live validation signals; a browser video clock alone can advance on a stopped frame.
 
-The account-free helper integration check is `scripts/check-camera-helper.cjs`. It exercises the actual client and HTTP service, real SDK Workers and UDP lifecycle, permitted handshake RPC, generated H.264/HEVC decoding and snapshots, privacy cancellation, app-client recreation, helper recreation, incompatible-update rejection, rollback, and final resource cleanup. Live camera endurance and VM deployment checks remain separate evidence.
+In app 3.45.1 / helper 0.1.1, `leaseStartedAt` identifies the helper lease, while `startedAt` and the optional `firstFrameAt` describe its current media source and first MPEG-TS output. A lease can outlive an individual source, so lease age does not establish continuous video delivery. Helper event logs use fixed, rate-limited categories and messages; they omit device IDs, serials, URLs, keys, and raw SDK errors.
+
+The account-free helper integration check is `scripts/check-camera-helper.cjs`. It exercises the actual client and HTTP service, real SDK Workers and UDP lifecycle, permitted handshake RPC, generated H.264/HEVC decoding and snapshots, privacy cancellation, app-client recreation, helper recreation, incompatible-update rejection, rollback, and final resource cleanup. These generated-media checks do not establish sustained playback from physical cameras.
+
+### Verified deployment and recovery
+
+On 2026-10-30, helper 0.1.0 / protocol 1 was installed on the Homey VM and passed its authenticated health check. The recorded lifecycle test then recreated the dedicated helper container, rejected an incompatible release before mutation, and restored the previous healthy image after a deliberately failed health check. The same persistent helper identity was preserved throughout. This verifies the deployment and recovery path; it does not establish camera-stream continuity during an update or sustained concurrent live playback.
+
+The subsequent live restart trial with app 3.45.0 / helper 0.1.0 preserved that identity and automatically recovered Garage. Its reported source bytes increased from 2,148,464 at 21:25:32 UTC to 7,334,820 at 21:25:52 UTC. Doorbell's existing snapshot Flow also completed a fresh capture successfully.
+
+Three cameras on the same HomeBase were decoded during the live trial: Garage at 2304×1296, Doorbell at 1600×1200, and Backyard Right at 2304×1296. All three were observed streaming, with counters increasing across sampled intervals. Startup retries and later source interruptions or resets also occurred. Sustained, uninterrupted three-camera playback remains unaccepted; these results establish simultaneous decoding and an observed restart recovery without resolving the remaining reliability issues.
+
+The 3.45.0 installer build passed 452 app tests and three helper-configuration tests, Homey debug validation, the SDK/UDP and generated FFmpeg media checks, and the actual installation-archive check. The latter verified the required runtime files and rejection of a failed upload. These build results and the VM lifecycle test are separate from live camera acceptance. Confirm fresh source state, increasing byte counts, decoded video, independent Stop/reopen, and stable Homey resource use before treating concurrent playback as accepted.
+
+The 3.45.1 maintenance build passed 454 app tests and 11 helper configuration/diagnostic tests, plus the real SDK/UDP, H.264/HEVC, snapshot, restart, rollback, Homey validation and archive checks. The exact Linux amd64 helper 0.1.1 image passed the generated-media integration check separately. A data-preserving live update from 3.45.0 to 3.45.1 retained all 87 device IDs, all ten Eufy camera registrations, both native dashboard layouts, app settings (including the helper identity and selection), and the dashboard connection. Matter Bridge remained running. Basement TV also decoded its native RTSP source at 1920×1080 during the live regression check; this source bypasses the external helper.
+
+The subsequent helper update from 0.1.0 to 0.1.1 passed authenticated health, preserved the private identity in its external volume, and left Homey’s main container identity and start time unchanged. The Homey app retained its existing connection throughout; no reconnection setup was performed.
+
+After both maintenance updates, Garage and Doorbell opened through the saved connection without bootstrap or key entry. Across the 21:36:47–21:37:47 UTC samples, their source byte counts increased from 2,238,140 to 17,870,340 and from 1,629,020 to 11,850,956 respectively, with each source timestamp unchanged. Both decoded at 2304×1296 and 1600×1200, and the Eufy app stayed running at about 132 MiB. This is a bounded post-update check, not an endurance guarantee.

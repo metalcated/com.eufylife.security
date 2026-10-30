@@ -12,11 +12,42 @@ const net = require('node:net');
 
 const OWNER = 'com.eufylife.security';
 const SDK = '4.2.6';
-const VERSION = '0.1.0';
+const VERSION = '0.1.1';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const IDENTITY = /^[A-Za-z0-9_-]{1,128}$/;
 const BODY_LIMIT = 512 * 1024;
 const EVENT_LIMIT = 64 * 1024;
+const DIAGNOSTIC_LIMIT = 64;
+const DIAGNOSTIC_WINDOW_MS = 60000;
+const DIAGNOSTICS = Object.freeze({
+    'source.starting': 'A camera source is starting.',
+    'source.ready': 'A camera source delivered video.',
+    'source.start_timeout': 'A camera source did not deliver video before its startup deadline.',
+    'source.failed': 'A camera source could not become ready.',
+    'source.closed': 'Camera source resources were closed.',
+    'source.close_failed': 'Camera source cleanup is unconfirmed; its capacity remains reserved.',
+    'p2p.starting': 'An independent P2P connection is starting.',
+    'p2p.failed': 'An independent P2P connection failed.',
+    'p2p.ended': 'An independent P2P connection ended.',
+    'media.failed': 'A camera media process failed.',
+    'media.ended': 'A camera media process ended.',
+    'lease.cancelled': 'A camera lease was cancelled by its owner.',
+    'lease.replaced': 'A camera lease was revoked by a newer app connection.',
+    'lease.expired': 'A camera lease expired without renewal.',
+    'capacity.sources': 'The four-source limit prevented another camera source.',
+    'capacity.requests': 'The bounded camera-request registry is full.',
+    'capacity.rpc': 'The pending camera API request limit was reached.',
+    'capacity.rpc_rate': 'The camera API request rate limit was reached.',
+    'rpc.refused': 'A camera API request was outside the permitted scope.',
+    'rpc.timeout': 'A camera API request did not receive a reply before its deadline.',
+    'rpc.failed': 'The app reported that a permitted camera API request failed.',
+    'helper.stopping': 'The camera helper is stopping and closing its sources.',
+    'diagnostics.suppressed': 'Further helper diagnostics are suppressed until the next minute.',
+});
+const START_TIMEOUT_MESSAGES = new Set([
+    'The camera did not deliver independent video in time.',
+    'The camera did not deliver video in time. Check its connection and retry.',
+]);
 const CAMERA_CLASSES = new Set(['Camera', 'SoloCamera', 'IndoorCamera', 'DoorbellCamera', 'WiredDoorbellCamera',
     'BatteryDoorbellCamera', 'FloodlightCamera', 'WallLightCam', 'GarageCamera', 'DoorbellLock', 'SmartDrop']);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -85,6 +116,9 @@ class HelperServer {
         this.host = options.host || '127.0.0.1'; this.port = options.port ?? 8769;
         if (this.host !== '127.0.0.1' || !Number.isInteger(this.port) || this.port < 0 || this.port > 65535) throw new Error('Invalid camera helper address.');
         this.now = options.now || Date.now; this.leaseMs = options.leaseMs ?? 75000;
+        this.writeDiagnostic = typeof options.onDiagnostic === 'function' ? options.onDiagnostic : entry => console.log(JSON.stringify(entry));
+        this.diagnosticWindow = this.now(); this.diagnosticCount = 0; this.diagnosticSuppressed = false;
+        this.observedSources = new WeakSet();
         this.startTimeoutMs = options.startTimeoutMs ?? 25000; this.rpcTimeoutMs = options.rpcTimeoutMs ?? 10000;
         this.closeTimeoutMs = options.closeTimeoutMs ?? 5000; this.maxSessions = Math.min(options.maxSessions || 4, 4);
         this.requestTtlMs = options.requestTtlMs ?? 120000; this.maxRequests = options.maxRequests || 128;
@@ -105,15 +139,33 @@ class HelperServer {
             resolveBinary: async () => options.ffmpeg || '/usr/bin/ffmpeg',
             createP2PSession: params => {
                 const record = params.homeyDevice.helperRecord;
+                record.sourceFailureReported = false;
+                this.diagnostic('p2p.starting');
                 const configured = { ...params, client: params.homeyDevice.rpcClient,
-                    onStream: (...args) => this.context.run(record, () => params.onStream(...args)),
-                    onStop: (...args) => this.context.run(record, () => params.onStop(...args)),
-                    onError: (...args) => this.context.run(record, () => params.onError(...args)) };
-                return options.createP2PSession ? options.createP2PSession(configured) : new this.runtime.WorkerSessionClass(configured);
+                    onStream: (...args) => this.context.run(record, () => {
+                        this.observeSource(record, this.manager.sessions?.get(record.serial));
+                        return params.onStream(...args);
+                    }),
+                    onStop: (...args) => this.context.run(record, () => {
+                        if (this.current(record)) { record.sourceFailureReported = true; this.diagnostic('p2p.ended'); }
+                        return params.onStop(...args);
+                    }),
+                    onError: error => this.context.run(record, () => {
+                        this.sourceFailure(record, error, 'p2p.failed');
+                        return params.onError(error);
+                    }) };
+                try { return options.createP2PSession ? options.createP2PSession(configured) : new this.runtime.WorkerSessionClass(configured); }
+                catch (error) { this.sourceFailure(record, error, 'p2p.failed'); throw error; }
             },
             spawn: (...args) => {
                 const proc = (options.spawn || spawn)(...args), record = this.context.getStore();
-                if (record) { record.processes.add(proc); proc.once('close', () => record.processes.delete(proc)); proc.once('error', () => record.processes.delete(proc)); }
+                if (record) {
+                    record.processes.add(proc); proc.once('close', () => record.processes.delete(proc));
+                    proc.once('error', () => { record.processes.delete(proc); if (this.current(record)) this.diagnostic('media.failed'); });
+                    proc.once('exit', code => {
+                        if (this.current(record) && this.manager.sessions?.get(record.serial)?.process === proc) this.diagnostic(code === 0 ? 'media.ended' : 'media.failed');
+                    });
+                }
                 return proc;
             } };
         this.manager = options.managerFactory ? options.managerFactory(homey, managerOptions) : new this.runtime.ManagerClass(homey, managerOptions);
@@ -128,6 +180,44 @@ class HelperServer {
         this.server.requestTimeout = 30000; this.server.headersTimeout = 10000; this.server.keepAliveTimeout = 5000;
         this.server.maxConnections = 64;
         this.server.on('connection', socket => { this.activeSockets.add(socket); socket.once('close', () => this.activeSockets.delete(socket)); });
+    }
+
+    // Only compile-time categories and messages cross this boundary. Never pass
+    // SDK errors, request objects, identifiers or media addresses to the sink.
+    diagnostic(event) {
+        if (!Object.hasOwn(DIAGNOSTICS, event) || event === 'diagnostics.suppressed') return;
+        if (this.now() - this.diagnosticWindow >= DIAGNOSTIC_WINDOW_MS) {
+            this.diagnosticWindow = this.now(); this.diagnosticCount = 0; this.diagnosticSuppressed = false;
+        }
+        let category = event;
+        if (this.diagnosticCount >= DIAGNOSTIC_LIMIT) {
+            if (this.diagnosticSuppressed) return;
+            this.diagnosticSuppressed = true; category = 'diagnostics.suppressed';
+        } else this.diagnosticCount++;
+        try {
+            const written = this.writeDiagnostic(Object.freeze({ event: category, message: DIAGNOSTICS[category] }));
+            written?.catch?.(() => {});
+        } catch { /* Diagnostics must not interrupt video or resource cleanup. */ }
+    }
+
+    startFailure(error, fallback = 'source.failed') {
+        return error?.mediaPublic === true && START_TIMEOUT_MESSAGES.has(error.message) ? 'source.start_timeout' : fallback;
+    }
+
+    sourceFailure(record, error, fallback) {
+        if (!this.current(record) || record.sourceFailureReported) return;
+        record.sourceFailureReported = true;
+        this.diagnostic(this.startFailure(error, fallback));
+    }
+
+    observeSource(record, session) {
+        if (!session || this.observedSources.has(session)) return;
+        this.observedSources.add(session);
+        session.ready.promise.then(() => {
+            if (this.current(record)) this.diagnostic('source.ready');
+        }, error => {
+            this.sourceFailure(record, error);
+        });
     }
 
     async listen() {
@@ -190,7 +280,7 @@ class HelperServer {
         let entry = this.requests.get(requestId);
         if (entry && (entry.owner !== binding.owner || entry.epoch !== binding.epoch || entry.deviceId !== binding.deviceId)) throw new HTTPError(409, 'The camera request belongs to another session.');
         if (!entry) {
-            if (this.requests.size >= this.maxRequests) throw new HTTPError(429, 'Too many camera requests. Retry later.');
+            if (this.requests.size >= this.maxRequests) { this.diagnostic('capacity.requests'); throw new HTTPError(429, 'Too many camera requests. Retry later.'); }
             entry = { owner: binding.owner, epoch: binding.epoch, deviceId: binding.deviceId, requestId };
             this.requests.set(requestId, entry);
         }
@@ -201,7 +291,7 @@ class HelperServer {
         if (!keys(body, ['owner', 'epoch', 'protocol', 'sdk']) || body.protocol !== 1 || body.sdk !== SDK) throw new HTTPError(409, 'The camera helper protocol is incompatible.');
         this.binding(body); this.owners.set(body.owner, body.epoch);
         const stopped = await Promise.allSettled([...this.records.values()].filter(record => record.owner === body.owner && record.epoch !== body.epoch)
-            .map(record => this.closeRecord(record)));
+            .map(record => { this.diagnostic('lease.replaced'); return this.closeRecord(record); }));
         if (stopped.some(result => result.status === 'rejected')) throw fixedError();
         return { protocol: 1, version: VERSION, sdk: SDK, instance: this.instance, owner: body.owner, epoch: body.epoch };
     }
@@ -232,7 +322,7 @@ class HelperServer {
         if (entry.cancelled) throw new HTTPError(409, 'The camera request was cancelled.');
         if (entry.record) return { id: entry.record.id, mediaUrl: entry.record.mediaUrl };
         if (this.cameras.has(cameraKey)) throw new HTTPError(409, 'This camera already has an active request.');
-        if (this.records.size >= this.maxSessions) throw new HTTPError(429, 'There are already four active camera sessions.');
+        if (this.records.size >= this.maxSessions) { this.diagnostic('capacity.sources'); throw new HTTPError(429, 'There are already four active camera sessions.'); }
         if ([...this.records.values()].some(record => record.serial === metadata.rawDevice.device_sn)) throw new HTTPError(409, 'This camera already has an active request.');
         const cap = crypto.createHmac('sha256', Buffer.from(this.secret, 'utf8')).update(`${body.owner}\0${body.deviceId}`).digest('hex').slice(0, 48);
         const record = { id: crypto.randomUUID(), requestId: body.requestId, owner: body.owner, epoch: body.epoch, deviceId: body.deviceId,
@@ -242,15 +332,17 @@ class HelperServer {
         this.records.set(record.id, record); this.cameras.set(cameraKey, record); this.capabilities.set(cap, record); entry.record = record;
         this.manager.tokens?.set(cap, { device: record.hd, token: cap });
         this.manager.registrations?.set(record.serial, 1);
+        this.diagnostic('source.starting');
         record.startPromise = this.context.run(record, async () => {
             if (record.closing) return;
             const session = await this.manager.getSession(record.hd); record.mediaSession = session;
+            this.observeSource(record, session);
             if (record.closing) { await this.manager.stopStream(record.serial); return; }
             session.ready.promise.then(() => {
                 if (!record.closing && !session.consumers?.size) this.manager.releaseConsumer?.(session, null);
             }).catch(() => {});
         });
-        record.startPromise.catch(() => {});
+        record.startPromise.catch(error => this.sourceFailure(record, error));
         return { id: record.id, mediaUrl: record.mediaUrl };
     }
 
@@ -258,16 +350,18 @@ class HelperServer {
         // A renewed lease can outlive several bounded Worker instances. Each
         // Worker keeps its own 32-call ceiling; transport IDs stay monotonic so
         // an idle/reopened camera cannot collide with a cached earlier reply.
-        if (!this.current(record) || !validRPC(record.metadata, method, args) || record.pending.size >= 4 || record.rpcId >= Number.MAX_SAFE_INTEGER) return Promise.reject(fixedError());
+        if (!this.current(record)) return Promise.reject(fixedError());
+        if (!validRPC(record.metadata, method, args) || record.rpcId >= Number.MAX_SAFE_INTEGER) { this.diagnostic('rpc.refused'); return Promise.reject(fixedError()); }
+        if (record.pending.size >= 4) { this.diagnostic('capacity.rpc'); return Promise.reject(fixedError()); }
         if (this.now() - record.rpcWindowStartedAt >= 60000 && !record.pending.size) {
             record.rpcWindowStartedAt = this.now(); record.rpcWindowCount = 0;
         }
-        if (record.rpcWindowCount >= 32) return Promise.reject(fixedError());
+        if (record.rpcWindowCount >= 32) { this.diagnostic('capacity.rpc_rate'); return Promise.reject(fixedError()); }
         const id = ++record.rpcId, packet = { id, method, args };
         if (Buffer.byteLength(JSON.stringify(packet)) + 1 > EVENT_LIMIT) return Promise.reject(fixedError());
         record.rpcWindowCount++;
         return new Promise((resolve, reject) => {
-            const pending = { packet, resolve, reject, timer: setTimeout(() => { record.pending.delete(id); reject(fixedError()); }, this.rpcTimeoutMs) };
+            const pending = { packet, resolve, reject, timer: setTimeout(() => { record.pending.delete(id); this.diagnostic('rpc.timeout'); reject(fixedError()); }, this.rpcTimeoutMs) };
             record.pending.set(id, pending); this.sendEvent(record, packet);
         });
     }
@@ -295,6 +389,7 @@ class HelperServer {
         const pending = record.pending.get(body.id);
         if (!pending) throw new HTTPError(404, 'Camera API request not found.');
         clearTimeout(pending.timer); record.pending.delete(body.id);
+        if (Object.hasOwn(body, 'error')) this.diagnostic('rpc.failed');
         Object.hasOwn(body, 'error') ? pending.reject(fixedError()) : pending.resolve(body.value);
         return { accepted: true };
     }
@@ -303,7 +398,8 @@ class HelperServer {
         const source = this.manager.getStatus(record.serial) || {};
         return { id: record.id, deviceId: record.deviceId,
             state: record.closing ? 'stopping' : ['streaming', 'stopped', 'starting'].includes(source.state) ? source.state : 'starting',
-            bytes: Number.isFinite(source.bytes) && source.bytes >= 0 ? source.bytes : 0, startedAt: record.startedAt,
+            bytes: Number.isFinite(source.bytes) && source.bytes >= 0 ? source.bytes : 0,
+            startedAt: Number.isFinite(source.startedAt) ? source.startedAt : record.startedAt, leaseStartedAt: record.startedAt,
             ...(Number.isFinite(source.firstFrameAt) ? { firstFrameAt: source.firstFrameAt } : {}),
             ...(source.error ? { error: 'The camera stream is unavailable. Reopen the camera to retry.' } : {}) };
     }
@@ -341,7 +437,8 @@ class HelperServer {
             if (this.cameras.get(record.cameraKey) === record) this.cameras.delete(record.cameraKey);
             if (this.capabilities.get(record.cap) === record) this.capabilities.delete(record.cap);
             if (entry?.record === record) entry.record = null;
-        })().catch(() => { record.closePromise = null; throw fixedError(); });
+            this.diagnostic('source.closed');
+        })().catch(() => { this.diagnostic('source.close_failed'); record.closePromise = null; throw fixedError(); });
         return record.closePromise;
     }
 
@@ -349,14 +446,14 @@ class HelperServer {
         if (!UUID.test(requestId) || !keys(body, ['owner', 'epoch', 'deviceId']) || !UUID.test(body.deviceId)) throw new HTTPError(400, 'Invalid camera cancellation.');
         this.binding(body); const entry = this.requestBinding(requestId, body);
         entry.cancelled = true; entry.expiresAt = this.now() + this.requestTtlMs;
-        if (entry.record) await this.closeRecord(entry.record);
+        if (entry.record) { this.diagnostic('lease.cancelled'); await this.closeRecord(entry.record); }
         return { cancelled: true, requestId };
     }
 
     async prune() {
         return this.mutate(async () => {
             const stopped = await Promise.allSettled([...this.records.values()].filter(record => record.expiresAt <= this.now())
-                .map(record => this.closeRecord(record)));
+                .map(record => { this.diagnostic('lease.expired'); return this.closeRecord(record); }));
             this.trimRequests();
             if (stopped.some(result => result.status === 'rejected')) throw fixedError();
         });
@@ -394,7 +491,7 @@ class HelperServer {
             return this.mutate(async () => {
                 const record = this.record(id, true);
                 if (Object.keys(body).length && (!keys(body, ['owner', 'epoch']) || body.owner !== record.owner || body.epoch !== record.epoch)) throw new HTTPError(409, 'The camera session is no longer current.');
-                await this.closeRecord(record); this.json(response, 200, { closed: true, id });
+                this.diagnostic('lease.cancelled'); await this.closeRecord(record); this.json(response, 200, { closed: true, id });
             });
         }
         const record = this.record(id);
@@ -427,6 +524,7 @@ class HelperServer {
 
     close() {
         if (this.closePromise) return this.closePromise;
+        this.diagnostic('helper.stopping');
         this.closed = true; clearInterval(this.pruneTimer);
         this.closePromise = (async () => {
             await this.mutations;

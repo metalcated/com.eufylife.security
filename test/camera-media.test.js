@@ -324,6 +324,30 @@ test('same-camera requests share one upstream and become ready only after comple
     assert.equal(h.manager.getStatus('CAMERA_A').state, 'streaming');
 });
 
+test('source status timestamps and byte counts describe each bounded viewing session', async t => {
+    let clock = 1000;
+    const h = harness(t, { now: () => clock });
+    const camera = h.camera();
+    const first = await h.manager.getSession(camera);
+    assert.deepEqual(h.manager.getStatus('CAMERA_A'), { state: 'starting', source: 'p2p', bytes: 0, consumers: 0, startedAt: 1000 });
+    clock = 1100;
+    await h.deliver(camera, transportPackets(4));
+    assert.deepEqual(h.manager.getStatus('CAMERA_A'), { state: 'streaming', source: 'p2p', bytes: 752,
+        consumers: 0, startedAt: 1000, firstFrameAt: 1100 });
+
+    h.fireTimer(104);
+    await flush();
+    assert.equal(first.stopped, true);
+    clock = 300000;
+    const next = await h.manager.getSession(camera);
+    assert.notEqual(next, first);
+    assert.deepEqual(h.manager.getStatus('CAMERA_A'), { state: 'starting', source: 'p2p', bytes: 0, consumers: 0, startedAt: 300000 });
+    clock = 300100;
+    await h.deliver(camera, transportPackets(2));
+    assert.deepEqual(h.manager.getStatus('CAMERA_A'), { state: 'streaming', source: 'p2p', bytes: 376,
+        consumers: 0, startedAt: 300000, firstFrameAt: 300100 });
+});
+
 test('selected cameras on one HomeBase use separate sources and stopping one leaves the other delivering media', async t => {
     const h = harness(t, { isolated: ['HOMEY_A', 'HOMEY_B'] });
     const a = h.camera('A', 'SHARED'), b = h.camera('B', 'SHARED');

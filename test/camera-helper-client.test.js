@@ -76,7 +76,10 @@ function harness(t, options = {}) {
             case 'renew': return response({ renewed: true, expiresAt: Date.now() + 75000 });
             case 'rpc': record.replies.push(body); return response({ accepted: true });
             case 'status': return response({ id: record.id, deviceId: record.deviceId, state: record.state, bytes: record.bytes,
-                startedAt: 100, error: SECRET, details: SECRET, token: SECRET });
+                startedAt: record.startedAt ?? 100,
+                ...(Object.hasOwn(record, 'leaseStartedAt') ? { leaseStartedAt: record.leaseStartedAt } : {}),
+                ...(Object.hasOwn(record, 'firstFrameAt') ? { firstFrameAt: record.firstFrameAt } : {}),
+                error: SECRET, details: SECRET, token: SECRET });
             case 'snapshot': return new Response(Buffer.from([0xff, 0xd8, 0xff, 0xd9]), { headers: { 'Content-Type': 'image/jpeg' } });
         }
     };
@@ -206,6 +209,27 @@ test('remote status fields and errors are reduced to safe cached state, and unre
     assert.deepEqual(h.client.getStatus('A'), { state: 'streaming', source: 'helper', bytes: 376, startedAt: 100 });
     [...h.records.values()][0].state = 'stopped'; await h.client.refreshStatus();
     assert.equal(h.client.getStatus('A').state, 'stopped'); assert.equal(JSON.stringify(h.client.getStatus('A')).includes(SECRET), false);
+});
+
+test('helper status follows source restarts while retaining the separate lease timestamp', async t => {
+    const h = harness(t);
+    await h.client.videoUrl(h.camera('A'));
+    assert.equal(Object.hasOwn(h.client.getStatus('A'), 'startedAt'), false, 'local readiness must not invent a source timestamp');
+    const source = [...h.records.values()][0];
+    Object.assign(source, { startedAt: 1000, firstFrameAt: 1100, leaseStartedAt: 900, bytes: 9400 });
+    await h.client.refreshStatus();
+    assert.deepEqual(h.client.getStatus('A'), { state: 'streaming', source: 'helper', bytes: 9400,
+        startedAt: 1000, leaseStartedAt: 900, firstFrameAt: 1100 });
+
+    Object.assign(source, { startedAt: 300000, firstFrameAt: 300100, bytes: 376 });
+    await h.client.refreshStatus();
+    assert.equal(h.records.size, 1, 'a source can restart within the same lease');
+    assert.deepEqual(h.client.getStatus('A'), { state: 'streaming', source: 'helper', bytes: 376,
+        startedAt: 300000, leaseStartedAt: 900, firstFrameAt: 300100 });
+
+    Object.assign(source, { leaseStartedAt: SECRET, firstFrameAt: { token: SECRET } });
+    await h.client.refreshStatus();
+    assert.deepEqual(h.client.getStatus('A'), { state: 'streaming', source: 'helper', bytes: 376, startedAt: 300000 });
 });
 
 test('cross-origin media responses and HTTP failures expose fixed errors, never secret response text', async t => {

@@ -18,7 +18,7 @@ RUN npm ci --omit=dev --no-audit --no-fund \
 FROM dependencies AS verified
 COPY . .
 RUN npm test \
-    && node --test helper/config.test.cjs \
+    && node --test helper/*.test.cjs \
     && homey app validate --level debug \
     && homey app build \
     && node scripts/check-media.cjs
