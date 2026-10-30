@@ -10,5 +10,5 @@ const fs = require('node:fs');
     });
     if (!response.ok) throw Error();
     const health = await response.json();
-    if (health.protocol !== 1 || health.version !== '0.1.1' || health.sdk !== '4.2.6') throw Error();
+    if (health.protocol !== 1 || health.version !== '0.1.2' || health.sdk !== '4.2.6') throw Error();
 })().catch(() => { process.exitCode = 1; });

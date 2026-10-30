@@ -10,7 +10,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
 FROM helper_runtime_base AS media-helper
 LABEL io.metalcated.eufy-media.protocol="1" \
       io.metalcated.eufy-media.sdk="4.2.6" \
-      io.metalcated.eufy-media.version="0.1.1"
+      io.metalcated.eufy-media.version="0.1.2"
 WORKDIR /app
 # The pinned production dependency tree contains JavaScript/protocol assets and
 # no native addons. It is reusable across the build host and the target VM.

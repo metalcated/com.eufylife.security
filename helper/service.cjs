@@ -12,7 +12,7 @@ const net = require('node:net');
 
 const OWNER = 'com.eufylife.security';
 const SDK = '4.2.6';
-const VERSION = '0.1.1';
+const VERSION = '0.1.2';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const IDENTITY = /^[A-Za-z0-9_-]{1,128}$/;
 const BODY_LIMIT = 512 * 1024;
@@ -34,6 +34,7 @@ const DIAGNOSTICS = Object.freeze({
     'lease.cancelled': 'A camera lease was cancelled by its owner.',
     'lease.replaced': 'A camera lease was revoked by a newer app connection.',
     'lease.expired': 'A camera lease expired without renewal.',
+    'lease.idle': 'An unused camera lease was retired after its source resources closed.',
     'capacity.sources': 'The four-source limit prevented another camera source.',
     'capacity.requests': 'The bounded camera-request registry is full.',
     'capacity.rpc': 'The pending camera API request limit was reached.',
@@ -120,16 +121,20 @@ class HelperServer {
         this.diagnosticWindow = this.now(); this.diagnosticCount = 0; this.diagnosticSuppressed = false;
         this.observedSources = new WeakSet();
         this.startTimeoutMs = options.startTimeoutMs ?? 25000; this.rpcTimeoutMs = options.rpcTimeoutMs ?? 10000;
+        this.idleGraceMs = options.idleGraceMs ?? 5000; this.firstViewerMs = options.firstViewerMs ?? 75000;
         this.closeTimeoutMs = options.closeTimeoutMs ?? 5000; this.maxSessions = Math.min(options.maxSessions || 4, 4);
         this.requestTtlMs = options.requestTtlMs ?? 120000; this.maxRequests = options.maxRequests || 128;
         for (const [value, maximum] of [[this.maxSessions, 4], [this.maxRequests, 128], [this.leaseMs, 75000],
-            [this.startTimeoutMs, 25000], [this.rpcTimeoutMs, 10000], [this.closeTimeoutMs, 5000], [this.requestTtlMs, 120000]]) {
+            [this.startTimeoutMs, 25000], [this.rpcTimeoutMs, 10000], [this.closeTimeoutMs, 5000], [this.requestTtlMs, 120000],
+            [this.idleGraceMs, 5000], [this.firstViewerMs, 75000]]) {
             if (!Number.isInteger(value) || value < 1 || value > maximum) throw new Error('Invalid camera helper limits.');
         }
         this.mediaDir = options.mediaDir || path.join(os.tmpdir(), `eufy-media-${process.pid}`);
         if (!path.isAbsolute(this.mediaDir)) throw new Error('The media cache must use an absolute path.');
         this.instance = crypto.randomUUID(); this.records = new Map(); this.cameras = new Map(); this.capabilities = new Map();
         this.requests = new Map(); this.owners = new Map(); this.context = new AsyncLocalStorage(); this.mutations = Promise.resolve();
+        // Indexed entries remain owned by the existing bounded request registry.
+        this.idleRetired = new Map();
         this.activeSockets = new Set(); this.runtime = options.runtime || runtime();
         const homey = this.homey = new EventEmitter();
         homey.platformVersion = 2; homey.settings = { get: name => name === 'camera_isolated_p2p_devices' ? true : undefined };
@@ -265,14 +270,68 @@ class HelperServer {
     current(record) { return !this.closed && !record.closing && this.owners.get(record.owner) === record.epoch && record.expiresAt > this.now(); }
 
     record(id, allowClosing = false) {
+        this.trimRequests();
         const record = this.records.get(id);
-        if (!record) throw new HTTPError(404, 'Camera session not found.');
+        if (!record) {
+            if (this.idleRetired.has(id)) throw new HTTPError(410, 'The unused camera lease was retired. Open the camera again.');
+            throw new HTTPError(404, 'Camera session not found.');
+        }
         if (!allowClosing && !this.current(record)) throw new HTTPError(409, 'The camera session is no longer current.');
         return record;
     }
 
     trimRequests() {
-        for (const [id, entry] of this.requests) if (entry.cancelled && entry.expiresAt <= this.now() && !entry.record) this.requests.delete(id);
+        for (const [id, entry] of this.requests) if (entry.cancelled && entry.expiresAt <= this.now() && !entry.record) {
+            this.requests.delete(id);
+            if (entry.idleRetiredId && this.idleRetired.get(entry.idleRetiredId) === entry) this.idleRetired.delete(entry.idleRetiredId);
+        }
+    }
+
+    async activeRecord(id) {
+        const record = this.records.get(id);
+        if (record?.idleRetiring) {
+            // Do not expose a recoverable 404/409 while source cleanup is still
+            // pending. Only a confirmed close authorizes client-side retirement.
+            try { if (!record.closePromise) throw fixedError(); await record.closePromise; }
+            catch { throw new HTTPError(503, 'Camera source cleanup is not yet confirmed.'); }
+        }
+        return this.record(id);
+    }
+
+    idleDue(record) {
+        if (record.closing || record.viewers.size || record.snapshots) return false;
+        const deadline = record.hasViewer ? record.idleSince + this.idleGraceMs : record.startedAt + this.firstViewerMs;
+        return this.now() >= deadline;
+    }
+
+    scheduleIdle(record) {
+        clearTimeout(record.idleTimer); record.idleTimer = null;
+        if (!this.current(record) || record.viewers.size || record.snapshots) return;
+        const deadline = record.hasViewer ? record.idleSince + this.idleGraceMs : record.startedAt + this.firstViewerMs;
+        record.idleTimer = setTimeout(() => {
+            record.idleTimer = null;
+            this.mutate(() => this.retireIdle(record)).catch(() => {});
+        }, Math.max(0, deadline - this.now()));
+        record.idleTimer.unref?.();
+    }
+
+    async retireIdle(record) {
+        if (this.records.get(record.id) !== record) return false;
+        if (!record.idleRetiring && !this.idleDue(record)) { this.scheduleIdle(record); return false; }
+        record.idleRetiring = true;
+        await this.closeRecord(record);
+        return true;
+    }
+
+    trackViewer(record, response) {
+        clearTimeout(record.idleTimer); record.idleTimer = null;
+        record.hasViewer = true; record.viewers.add(response);
+        const release = () => {
+            if (!record.viewers.delete(response)) return;
+            if (!record.viewers.size) record.idleSince = this.now();
+            this.scheduleIdle(record);
+        };
+        response.once('close', release); response.once('finish', release);
     }
 
     requestBinding(requestId, binding) {
@@ -327,7 +386,8 @@ class HelperServer {
         const cap = crypto.createHmac('sha256', Buffer.from(this.secret, 'utf8')).update(`${body.owner}\0${body.deviceId}`).digest('hex').slice(0, 48);
         const record = { id: crypto.randomUUID(), requestId: body.requestId, owner: body.owner, epoch: body.epoch, deviceId: body.deviceId,
             metadata, serial: metadata.rawDevice.device_sn, cap, cameraKey, expiresAt: this.now() + this.leaseMs,
-            startedAt: this.now(), pending: new Map(), rpcId: 0, rpcWindowStartedAt: this.now(), rpcWindowCount: 0, processes: new Set() };
+            startedAt: this.now(), pending: new Map(), rpcId: 0, rpcWindowStartedAt: this.now(), rpcWindowCount: 0, processes: new Set(),
+            viewers: new Set(), snapshots: 0, hasViewer: false };
         record.mediaUrl = `${this.origin}/v1/media/${cap}.ts`; record.hd = this.makeDevice(record);
         this.records.set(record.id, record); this.cameras.set(cameraKey, record); this.capabilities.set(cap, record); entry.record = record;
         this.manager.tokens?.set(cap, { device: record.hd, token: cap });
@@ -343,6 +403,7 @@ class HelperServer {
             }).catch(() => {});
         });
         record.startPromise.catch(error => this.sourceFailure(record, error));
+        this.scheduleIdle(record);
         return { id: record.id, mediaUrl: record.mediaUrl };
     }
 
@@ -422,6 +483,7 @@ class HelperServer {
     closeRecord(record) {
         if (record.closePromise) return record.closePromise;
         record.closing = true;
+        clearTimeout(record.idleTimer); record.idleTimer = null;
         record.hd._started = false;
         const entry = this.requests.get(record.requestId);
         if (entry) { entry.cancelled = true; entry.expiresAt = this.now() + this.requestTtlMs; }
@@ -437,6 +499,12 @@ class HelperServer {
             if (this.cameras.get(record.cameraKey) === record) this.cameras.delete(record.cameraKey);
             if (this.capabilities.get(record.cap) === record) this.capabilities.delete(record.cap);
             if (entry?.record === record) entry.record = null;
+            if (record.idleRetiring && entry) {
+                entry.expiresAt = this.now() + this.requestTtlMs;
+                entry.idleRetiredId = record.id; entry.idleRetiredCap = record.cap;
+                this.idleRetired.set(record.id, entry);
+                this.diagnostic('lease.idle');
+            }
             this.diagnostic('source.closed');
         })().catch(() => { this.diagnostic('source.close_failed'); record.closePromise = null; throw fixedError(); });
         return record.closePromise;
@@ -445,15 +513,23 @@ class HelperServer {
     async cancel(requestId, body) {
         if (!UUID.test(requestId) || !keys(body, ['owner', 'epoch', 'deviceId']) || !UUID.test(body.deviceId)) throw new HTTPError(400, 'Invalid camera cancellation.');
         this.binding(body); const entry = this.requestBinding(requestId, body);
+        const assertNotIdleRetired = () => {
+            if (entry.idleRetiredId && this.idleRetired.get(entry.idleRetiredId) === entry) throw new HTTPError(410, 'The unused camera lease was retired. Open the camera again.');
+        };
+        assertNotIdleRetired();
         entry.cancelled = true; entry.expiresAt = this.now() + this.requestTtlMs;
         if (entry.record) { this.diagnostic('lease.cancelled'); await this.closeRecord(entry.record); }
+        assertNotIdleRetired();
         return { cancelled: true, requestId };
     }
 
     async prune() {
         return this.mutate(async () => {
-            const stopped = await Promise.allSettled([...this.records.values()].filter(record => record.expiresAt <= this.now())
-                .map(record => { this.diagnostic('lease.expired'); return this.closeRecord(record); }));
+            const stopped = await Promise.allSettled([...this.records.values()].flatMap(record => {
+                if (record.idleRetiring || this.idleDue(record)) return [this.retireIdle(record)];
+                if (record.expiresAt <= this.now()) { this.diagnostic('lease.expired'); return [this.closeRecord(record)]; }
+                return [];
+            }));
             this.trimRequests();
             if (stopped.some(result => result.status === 'rejected')) throw fixedError();
         });
@@ -463,8 +539,15 @@ class HelperServer {
         const route = request.url || '';
         const media = /^\/v1\/media\/([a-f0-9]{48})\.ts$/.exec(route);
         if (media && request.method === 'GET') {
+            this.trimRequests();
             const record = this.capabilities.get(media[1]);
-            if (!record || !this.current(record)) throw new HTTPError(404, 'Camera stream not found.');
+            if (!record) {
+                if ([...this.idleRetired.values()].some(entry => entry.idleRetiredCap === media[1])) throw new HTTPError(410, 'The unused camera lease was retired. Open the camera again.');
+                throw new HTTPError(404, 'Camera stream not found.');
+            }
+            if (record.idleRetiring) await this.activeRecord(record.id);
+            if (!this.current(record)) throw new HTTPError(404, 'Camera stream not found.');
+            this.trackViewer(record, response);
             await record.startPromise;
             if (!this.current(record)) throw new HTTPError(404, 'Camera stream not found.');
             request.url = `/live/${record.cap}.ts`;
@@ -494,7 +577,7 @@ class HelperServer {
                 this.diagnostic('lease.cancelled'); await this.closeRecord(record); this.json(response, 200, { closed: true, id });
             });
         }
-        const record = this.record(id);
+        const record = await this.activeRecord(id);
         if (request.method === 'GET' && action === 'events') return this.events(record, response);
         if (request.method === 'GET' && action === 'status') return this.json(response, 200, this.status(record));
         if (request.method === 'POST' && action === 'rpc') return this.json(response, 200, this.reply(record, await this.body(request)));
@@ -505,19 +588,35 @@ class HelperServer {
         }
         if (request.method === 'GET' && action === 'ready') {
             await record.startPromise; const session = await this.context.run(record, () => this.manager.getSession(record.hd));
-            await session.ready.promise;
-            if (!this.current(record)) throw new HTTPError(409, 'The camera session is no longer current.');
+            try { await session.ready.promise; }
+            catch (error) { if (record.idleRetiring) await this.activeRecord(id); throw error; }
+            await this.activeRecord(id);
             return this.json(response, 200, { ready: true, id });
         }
         if (request.method === 'GET' && action === 'snapshot') {
-            await this.context.run(record, () => this.manager.requestSnapshot(record.hd));
-            if (!this.current(record)) throw new HTTPError(409, 'The camera session is no longer current.');
-            const jpeg = await fs.readFile(path.join(this.mediaDir, `${record.serial}_snapshot.jpg`));
-            if (!this.current(record)) throw new HTTPError(409, 'The camera session is no longer current.');
-            if (jpeg.length < 4 || jpeg.length > 8 * 1024 * 1024 || jpeg[0] !== 0xff || jpeg[1] !== 0xd8
-                || jpeg.at(-2) !== 0xff || jpeg.at(-1) !== 0xd9) throw fixedError();
-            response.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': jpeg.length, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
-            response.end(jpeg); return;
+            record.snapshots++; clearTimeout(record.idleTimer); record.idleTimer = null;
+            let captureComplete = false, responseComplete = false, delivered = false, released = false;
+            const release = () => {
+                if (released || !captureComplete || !responseComplete) return;
+                released = true; response.removeListener('finish', completeResponse); response.removeListener('close', completeResponse);
+                record.snapshots--; this.scheduleIdle(record);
+            };
+            const completeResponse = () => { responseComplete = true; release(); };
+            response.once('finish', completeResponse); response.once('close', completeResponse);
+            try {
+                await this.context.run(record, () => this.manager.requestSnapshot(record.hd));
+                if (!this.current(record)) throw new HTTPError(409, 'The camera session is no longer current.');
+                const jpeg = await fs.readFile(path.join(this.mediaDir, `${record.serial}_snapshot.jpg`));
+                if (!this.current(record)) throw new HTTPError(409, 'The camera session is no longer current.');
+                if (jpeg.length < 4 || jpeg.length > 8 * 1024 * 1024 || jpeg[0] !== 0xff || jpeg[1] !== 0xd8
+                    || jpeg.at(-2) !== 0xff || jpeg.at(-1) !== 0xd9) throw fixedError();
+                response.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': jpeg.length, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
+                response.end(jpeg); delivered = true; return;
+            } finally {
+                captureComplete = true;
+                if (!delivered || response.writableFinished || response.destroyed) responseComplete = true;
+                release();
+            }
         }
         throw new HTTPError(404, 'Camera helper endpoint not found.');
     }

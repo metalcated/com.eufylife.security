@@ -24,6 +24,7 @@ const BASE = 'FIXTURE_HOMEBASE';
 const workers = [], adapters = [], helpers = [], clients = [], processes = new Set(), sources = new Map();
 const diagnostics = [];
 const controlServers = new Set();
+const mediaControllers = new Set();
 let workspace, binary, sourceMode = 'worker', blockedClient = false, helper, client, settings, pausedDsk;
 
 const defer = () => { let resolve; const promise = new Promise(yes => { resolve = yes; }); return { promise, resolve }; };
@@ -166,7 +167,7 @@ const homey = { settings: { get: name => settings.get(name) }, app: { eufyClient
 function createClient() {
     const instance = new CameraHelperClient({ homey,
         assertCamera: hd => { if (!hd.allowed) throw Error('Synthetic privacy mode.'); },
-        requestTimeoutMs: 4000, readyTimeoutMs: 18000, eventsTimeoutMs: 25000, renewIntervalMs: 250,
+        requestTimeoutMs: 10000, readyTimeoutMs: 18000, eventsTimeoutMs: 25000, renewIntervalMs: 250,
         retryDelays: [30, 60, 100, 200],
         fetch: (url, options) => {
             if (blockedClient) return Promise.reject(Error('Synthetic helper restart.'));
@@ -197,6 +198,16 @@ async function decodedFrame(url) {
     proc.stdout.on('data', bytes => { size += bytes.length; if (size > 1024 * 1024) proc.kill('SIGTERM'); else chunks.push(bytes); });
     await bounded(new Promise((resolve, reject) => { proc.once('error', reject); proc.once('close', code => code === 0 ? resolve() : reject(Error('Generated HTTP stream did not decode.'))); }), 'HTTP decoder timed out.');
     return jpegDimensions(Buffer.concat(chunks));
+}
+
+async function holdViewer(url) {
+    const controller = new AbortController(); mediaControllers.add(controller);
+    const response = await fetch(url, { signal: controller.signal });
+    assert.equal(response.status, 200, 'An active fixture viewer could not open its media lease.');
+    const reader = response.body.getReader();
+    const draining = (async () => { while (!(await reader.read()).done) { /* Retain a real HTTP viewer. */ } })();
+    draining.catch(() => {});
+    return async () => { controller.abort(); await draining.catch(() => {}); mediaControllers.delete(controller); };
 }
 
 async function workerLifecycle() {
@@ -233,6 +244,9 @@ async function mediaAndUpdates(port) {
     sourceMode = 'media';
     const a = camera('M'), b = camera('N'), hevc = camera('O', VideoCodec.H265);
     const [aUrl, bUrl, hevcUrl] = await Promise.all([client.videoUrl(a), client.videoUrl(b), client.videoUrl(hevc)]);
+    // These update/snapshot checks need continuing viewers; the separate idle
+    // case below intentionally removes its final HTTP viewer and awaits410.
+    const viewers = await Promise.all([aUrl, bUrl, hevcUrl].map(holdViewer));
     const frames = await Promise.all([decodedFrame(aUrl), decodedFrame(aUrl), decodedFrame(bUrl), decodedFrame(hevcUrl)]);
     assert.deepEqual(frames.slice(0, 3), Array(3).fill({ width: 160, height: 120 }));
     assert.deepEqual(frames[3], { width: 640, height: 360 });
@@ -247,7 +261,7 @@ async function mediaAndUpdates(port) {
 
     // Recreate the Homey-side client: a new epoch cannot use old sessions, but
     // the persistent device capability is unchanged after explicit restoration.
-    await client.dispose(); client = createClient();
+    await Promise.all(viewers.map(close => close())); await client.dispose(); client = createClient();
     const restored = await client.videoUrl(a); assert.equal(restored, aUrl);
     await decodedFrame(restored);
     const oldInstance = helper.instance, oldSession = client.entries.get(a.EufyDevice.getSerial()).id;
@@ -293,6 +307,23 @@ async function incompatibleUpgradeRollback({ a, aUrl }, workingOrigin) {
     controlServers.delete(future);
 }
 
+async function idleReleaseAndExplicitReopen() {
+    const hd = camera('P'), serial = hd.EufyDevice.getSerial();
+    const url = await client.videoUrl(hd);
+    await decodedFrame(url); // Closing this HTTP viewer is the only stop signal.
+    const count = starts.get(serial);
+    await until(() => helper.records.size === 0 && client.sourceCount() === 0,
+        'Closing Live View did not release its server lease and client capacity.', 12000);
+    assert.equal((await fetch(url)).status, 410);
+    await sleep(400);
+    assert.equal(starts.get(serial), count, 'The client automatically recreated an idle-retired camera.');
+    assert.equal(helper.records.size, 0);
+    assert.equal(await client.videoUrl(hd), url, 'Explicitly reopening changed the stable camera capability.');
+    await decodedFrame(url);
+    await client.stop(serial);
+    assert.equal(helper.records.size, 0); assert.equal(client.sourceCount(), 0);
+}
+
 async function main() {
     workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'homey-helper-smoke-'));
     const resolver = new FfmpegResolver(homey);
@@ -306,16 +337,18 @@ async function main() {
     await workerLifecycle();
     const restored = await mediaAndUpdates(started.port);
     await incompatibleUpgradeRollback(restored, started.origin);
+    await idleReleaseAndExplicitReopen();
     await client.dispose();
     assert.equal(helper.records.size, 0);
     await helper.close();
     assert.ok(workers.every(worker => worker.threadId === -1));
     assert.equal(sources.size, 0);
-    console.log('Camera helper integration verified: actual Homey client/protocol, real SDK workers and owned UDP cleanup, cipher RPC/fallback, late privacy cancellation, isolated same-HomeBase feeds, real H264/HEVC HTTP decoding and snapshots, app-client recreation, persistent-link helper restart recovery, incompatible-upgrade rollback, and final resource cleanup.');
+    console.log('Camera helper integration verified: actual Homey client/protocol, real SDK workers and owned UDP cleanup, cipher RPC/fallback, late privacy cancellation, isolated same-HomeBase feeds, real H264/HEVC HTTP decoding and snapshots, app-client recreation, persistent-link helper restart recovery, incompatible-upgrade rollback, HTTP-viewer idle retirement without auto-recreation, explicit same-camera reopening, and final resource cleanup.');
 }
 
 async function cleanup() {
     blockedClient = false;
+    for (const controller of mediaControllers) controller.abort();
     await Promise.allSettled(clients.map(item => bounded(item.dispose(), 'Client cleanup deadline.', 4000)));
     await Promise.allSettled(helpers.map(item => bounded(item.close(), 'Helper cleanup deadline.', 6000)));
     await Promise.allSettled(workers.filter(worker => worker.threadId !== -1).map(worker => worker.terminate()));

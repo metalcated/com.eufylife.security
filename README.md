@@ -139,13 +139,15 @@ The 2026-10-30 trial used Homey Self-Hosted 13.5.3 with 8 GiB VM RAM and four vC
 
 The in-app concurrent rollout was disabled after this trial. Native RTSP and the existing single-connection P2P path remain available. Additional VM memory/CPU did not remove the app watchdog constraints. The external helper below moves media processing outside the Homey app without changing camera stream settings. Its deployment and recovery checks have passed; sustained concurrent playback on the actual cameras remains a separate acceptance step.
 
-## External media helper (3.45.1)
+## External media helper (3.45.3)
 
 The optional media helper moves selected P2P camera sessions, FFmpeg, and JPEG decoding into a separate Docker container. Homey continues registering the same Eufy-owned camera device and `main` video slot through its supported SDK. Native RTSP retains its direct path. Account credentials and cloud authentication remain in the Eufy app; the helper receives only scoped camera metadata and the bounded read-only handshake responses required for that camera.
 
-App 3.45.1 and helper 0.1.1 add clearer source timing and bounded failure diagnostics. The earlier installation, rollback, restart, and live-camera results below retain the versions actually tested.
+App 3.45.1 and helper 0.1.1 added clearer source timing and bounded failure diagnostics. App 3.45.2 and helper 0.1.2 add coordinated retirement of unused camera leases. The earlier installation, rollback, restart, and live-camera results below retain the versions actually tested; they do not establish live acceptance of the new idle-cleanup behavior.
 
 The helper binds to `127.0.0.1` on the same Linux VM as Homey. Control requests require its persistent private key; video URLs carry a separate opaque media capability. Neither is exposed by the diagnostic API. An active, current lease is required even when an existing media URL is known. Homey validates camera privacy, paired-device identity, Station identity, client identity, and selected-device scope before supplying keys and renewing a lease. Leases last at most 75 seconds without renewal. Explicit Stop, privacy changes, app epoch changes, and cancellation close the camera independently of its peers. At most four pending, active, or closing relayed sources are reserved across the app and helper; native RTSP bypasses this relay count.
+
+Helper 0.1.2 also retires an unused lease after 75 seconds if its first viewer never arrives. Once a viewer has connected, the last HTTP viewer's disconnection starts a five-second grace period for proxy reconnection; an active snapshot keeps the lease in use. After confirmed source cleanup, the helper returns HTTP 410 for the retired lease. App 3.45.2 releases its cached reservation and waits for a new camera request instead of automatically recreating unused video. This idle policy does not extend or shorten the existing maximum camera-session duration, and frontend closure can still precede the Homey proxy's upstream disconnection.
 
 `camera_helper_connection` and `camera_helper_devices` are separate Homey app settings, outside the logged Eufy account configuration. A configured camera that cannot reach its helper reports a camera error instead of silently starting expensive concurrent video inside Homey. Ordinary device controls, events, and account reconnection retain their existing paths. The helper uses the existing bounded Worker adapter and terminates each owned Worker during cleanup. It does not patch Homey's image, runtime, watchdog, or source.
 
@@ -157,7 +159,7 @@ On the VM, place `compose.yaml`, `example.env`, `healthcheck.cjs`, and `manage.p
 
 ```bash
 sudo python3 /opt/homey-eufy-media-helper/manage.py \
-  --image metalcated/homey-eufy-media-helper:0.1.1 \
+  --image metalcated/homey-eufy-media-helper:0.1.2 \
   --image-id sha256:REVIEWED_IMAGE_ID \
   --seed-token /private/path/to/bootstrap.key
 ```
@@ -172,7 +174,18 @@ Homey server updates preserve installed app code and settings in Homey's persist
 
 The current Homey updater excludes development-installed apps from routine App Store update checks. Keep this fork and merge/test upstream Eufy changes into it. Explicitly installing the official Store version over the same app ID can replace the helper bridge. Upstream protocol, SDK, and Homey breaking changes still require compatibility work; persistence is not a guarantee that an arbitrary future version is compatible.
 
-App/helper protocol version 1 and the pinned Eufy SDK 4.2.6 are negotiated before camera creation. Incompatible versions fail before starting a source. The management tool keeps before/accepted release records and verifies authenticated health after recreation. A failed update automatically restores the previous image and environment. An explicit rollback uses the prior recorded image ID for both `--image` and `--image-id`. Keep those images and back up both Homey's user volume and the helper data volume. The updater never prunes images or deletes the external data volume.
+App/helper protocol version 1 and the pinned Eufy SDK 4.2.6 are checked before camera creation. A protocol or SDK mismatch prevents creation, but those checks do not detect every behavioral incompatibility. In particular, idle retirement requires the compatible app version:
+
+| Eufy app | Helper | Compatibility |
+| --- | --- | --- |
+| 3.45.1 | 0.1.1 | Previous compatible pair; dated validation is recorded below. |
+| 3.45.2 or 3.45.3 | 0.1.1 | Compatible with the earlier helper behavior; the new idle-slot cleanup is unavailable. |
+| 3.45.2 or 3.45.3 | 0.1.2 | Matched versions for coordinated idle retirement; 3.45.3 also cancels failed initial requests instead of warming unused cameras. |
+| 3.45.1 | 0.1.2 | Unsupported: the old app treats idle retirement as an outage and can restart unused cameras while retaining cached source slots. |
+
+For these controlled fork updates, **upgrade the app first, then the helper**. **Roll back the helper first, then the app**: restore helper 0.1.1 before downgrading the app to 3.45.1. An app-only downgrade while helper 0.1.2 remains installed is outside the supported rollback procedure. Authenticated health can succeed for that unsupported pair, so use the version matrix as well as the health check. This release uses a paired rollback policy rather than optional idle-feature negotiation.
+
+The management tool keeps before/accepted release records and verifies authenticated health after recreation. A failed helper update automatically restores its previous image and environment; it does not change the installed Homey app. An explicit helper rollback uses the prior recorded image ID for both `--image` and `--image-id`. Keep those images and back up both Homey's user volume and the helper data volume. The updater never prunes images or deletes the external data volume.
 
 The authenticated Eufy API `GET /camera-helper` reports only configuration, availability, protocol, version, SDK, and instance identity. `GET /cameras/status` refreshes bounded helper status and reports source state and byte counts without keys, cloud records, or media URLs. Increasing byte counts and successful decoding are the live validation signals; a browser video clock alone can advance on a stopped frame.
 
@@ -195,3 +208,17 @@ The 3.45.1 maintenance build passed 454 app tests and 11 helper configuration/di
 The subsequent helper update from 0.1.0 to 0.1.1 passed authenticated health, preserved the private identity in its external volume, and left Homey’s main container identity and start time unchanged. The Homey app retained its existing connection throughout; no reconnection setup was performed.
 
 After both maintenance updates, Garage and Doorbell opened through the saved connection without bootstrap or key entry. Across the 21:36:47–21:37:47 UTC samples, their source byte counts increased from 2,238,140 to 17,870,340 and from 1,629,020 to 11,850,956 respectively, with each source timestamp unchanged. Both decoded at 2304×1296 and 1600×1200, and the Eufy app stayed running at about 132 MiB. This is a bounded post-update check, not an endurance guarantee.
+
+The 3.45.2 build passed 482 app tests and 11 helper configuration/diagnostic tests, Homey debug validation, the installation archive checks, and the generated SDK/FFmpeg media suite. The exact Linux amd64 helper 0.1.2 image independently passed the real client/service check, including idle closure, zero remaining server/client reservations, no automatic recreation, and explicit same-camera reopening with the same media capability and decoded video. The data-preserving live app update to 3.45.2 retained all 87 devices, all ten Eufy camera registrations, both native dashboard layouts, app configuration and dashboard connection. The subsequent helper update retained its private identity and left Homey’s main container unchanged.
+
+App 3.45.3 additionally cancels an initial native camera request if it fails before returning a usable video URL. It releases that request after confirmed cleanup and waits for an explicit retry. Failed cleanup keeps its capacity reservation and retries cleanup only. Recovery of an already established feed is unchanged.
+
+The live idle trial with app 3.45.2 / helper 0.1.2 issued four camera requests (Garage, Doorbell, Backyard Right and Backyard Left). Three produced decoded video; Backyard Right did not connect in that round. After closing the views, all four reported stopped at 22:06:56 UTC and remained stopped at 22:07:16 UTC. This validates the native viewer-close path and lack of automatic recreation; it does not establish uninterrupted four-camera playback.
+
+At 22:08:58 UTC, the fifth device (Basement Door video lock) was streaming through helper 0.1.2, with 9,384,772 source bytes and decoded 960×720 video, while the prior four cameras remained stopped. This demonstrates reuse of the released capacity on the actual Homey native-video path.
+
+The final 3.45.3 app build passed 484 app tests and 11 helper tests, plus the SDK/UDP, generated H.264/HEVC, snapshot, restart, rollback, idle cleanup/reopen, Homey validation and installation archive checks. The app-only change does not change the helper’s runtime or protocol.
+
+After the final app update to 3.45.3, the installer again confirmed all 87 devices, ten Eufy camera registrations, both native dashboard layouts, app configuration and dashboard connection were preserved, with Matter Bridge running. A helper-side process/resource sample after closing the previous test views showed no FFmpeg process, authenticated health passing, approximately 119.9 MiB resident memory, and 0.03% CPU.
+
+The final live reopen trial on app 3.45.3 / helper 0.1.2 reopened Garage and Doorbell at 2304×1296 and 1600×1200. Between 22:12:40 and 22:13:00 UTC, their byte counters advanced from 7,672,280 to 11,788,540 and from 5,460,460 to 10,004,984 with unchanged source timestamps. The Eufy app stayed running at approximately 132 MiB. This remains a bounded live check; the earlier multi-camera interruptions are not an accepted endurance result.

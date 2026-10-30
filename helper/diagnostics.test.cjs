@@ -89,11 +89,11 @@ test('first media readiness and source replacement status use source timing rath
 });
 
 test('source capacity, lease expiry and failed cleanup remain distinct without exposing identities', async t => {
-    const f = fixture(t, { maxSessions: 1 }); await f.connect();
+    const f = fixture(t, { maxSessions: 1, leaseMs: 100 }); await f.connect();
     const record = await f.open();
     await assert.rejects(f.open('PRIVATE_OTHER'), error => error.status === 429);
     assert.ok(f.entries.some(entry => entry.event === 'capacity.sources'));
-    f.advance(75001); f.manager.failClose = true;
+    f.advance(101); f.manager.failClose = true;
     await assert.rejects(f.helper.prune());
     assert.ok(f.entries.some(entry => entry.event === 'lease.expired'));
     assert.ok(f.entries.some(entry => entry.event === 'source.close_failed'));

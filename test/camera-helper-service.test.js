@@ -5,6 +5,7 @@ const { randomUUID } = require('node:crypto');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const http = require('node:http');
 const nodeTest = require('node:test');
 
 const test = (name, fn) => nodeTest(name, { timeout: 7000 }, fn);
@@ -111,19 +112,29 @@ class FixtureManager {
     }
     async serve(request, response) {
         this.fixture.mediaRequests.push(request.url);
+        const capability = /^\/live\/([a-f0-9]{48})\.ts$/.exec(request.url)?.[1];
+        const session = [...this.sessions.values()].find(candidate => candidate.hd.helperRecord.cap === capability);
+        if (session) await session.ready.promise;
         const bytes = Buffer.alloc(188);
         bytes[0] = 0x47;
         response.writeHead(200, { 'Content-Type': 'video/MP2T' });
-        response.end(bytes);
+        if (this.fixture.keepMediaOpen) response.write(bytes);
+        else response.end(bytes);
     }
-    async requestSnapshot() { return true; }
+    async requestSnapshot(hd) {
+        if (this.fixture.snapshotGate) await this.fixture.snapshotGate.promise;
+        await fs.writeFile(path.join(this.fixture.workspace, `${hd.EufyDevice.getSerial()}_snapshot.jpg`),
+            this.fixture.snapshotBytes || Buffer.from([0xff, 0xd8, 0, 0, 0xff, 0xd9]));
+        return true;
+    }
 }
 
 async function fixture(t, options = {}) {
     const { HelperServer } = require('../helper/service.cjs');
     const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'homey-helper-service-test-'));
     const fixture = { now: options.now || (() => Date.now()), autoReady: options.autoReady !== false,
-        closeGates: new Map(), managers: [], mediaRequests: [], servers: [] };
+        closeGates: new Map(), managers: [], mediaRequests: [], servers: [], workspace,
+        keepMediaOpen: options.keepMediaOpen === true, snapshotGate: options.snapshotGate, snapshotBytes: options.snapshotBytes };
     t.after(async () => {
         for (const gate of fixture.closeGates.values()) gate.resolve();
         await Promise.allSettled(fixture.servers.map(server => server.close()));
@@ -143,7 +154,7 @@ async function fixture(t, options = {}) {
         fixture.servers.push(helper);
         return { helper, origin: `http://127.0.0.1:${address.port}` };
     };
-    const running = await makeServer();
+    const running = await makeServer(options.serverOptions);
     Object.assign(fixture, running, { makeServer, epoch: randomUUID(), owner: OWNER });
     fixture.request = async (method, route, body, extra = {}) => {
         const response = await fetch(`${extra.origin || fixture.origin}${route}`, {
@@ -535,4 +546,267 @@ test('lease pruning disposes every expired source while retaining only failed cl
     f.closeGates.delete('FIXTURE_CAMERA_A');
     assert.equal((await f.request('DELETE', `/v1/sessions/${first.id}`, { owner: OWNER, epoch: f.epoch })).status, 200);
     assert.equal(f.helper.records.size, 0);
+});
+
+async function viewed(f, session) {
+    const response = await fetch(session.mediaUrl, { signal: AbortSignal.timeout(4000) });
+    assert.equal(response.status, 200);
+    return response;
+}
+async function closedViewer(f, session, response) {
+    await response.body.cancel();
+    for (let index = 0; index < 20 && f.helper.records.get(session.id)?.viewers.size; index++) await turn();
+    assert.equal(f.helper.records.get(session.id)?.viewers.size, 0);
+}
+
+test('four closed viewers retire their leases and allow a fifth camera without renewing the old sources', async t => {
+    let now = 1000;
+    const f = await fixture(t, { now: () => now });
+    const sessions = [];
+    for (const label of ['A', 'B', 'C', 'D']) {
+        const session = await f.open(label); sessions.push(session);
+        const response = await viewed(f, session); await response.arrayBuffer();
+    }
+    now += 5001; await f.helper.prune();
+    assert.equal(f.helper.records.size, 0);
+    for (const session of sessions) {
+        assert.equal((await f.request('GET', `/v1/sessions/${session.id}/status`)).status, 410);
+        assert.equal((await f.request('POST', `/v1/sessions/${session.id}/renew`, { owner: OWNER, epoch: f.epoch })).status, 410);
+        assert.equal((await f.request('GET', new URL(session.mediaUrl).pathname)).status, 410);
+    }
+    assert.equal(f.managers.at(-1).starts.length, 4);
+    await f.open('E');
+    assert.equal(f.managers.at(-1).starts.length, 5);
+});
+
+test('a fresh same-camera lease takes precedence over the retired stable media capability', async t => {
+    let now = 1000;
+    const f = await fixture(t, { now: () => now });
+    const deviceId = randomUUID(), old = await f.open('A', { deviceId });
+    await (await viewed(f, old)).arrayBuffer();
+    now += 5001; await f.helper.prune();
+    for (const action of ['status', 'events', 'ready']) assert.equal((await f.request('GET', `/v1/sessions/${old.id}/${action}`)).status, 410);
+    assert.equal((await f.request('POST', `/v1/sessions/${old.id}/rpc`, { id: 1, value: {} })).status, 410);
+    const reopened = await f.open('A', { deviceId });
+    assert.notEqual(reopened.id, old.id); assert.equal(reopened.mediaUrl, old.mediaUrl);
+    assert.equal((await f.request('GET', new URL(old.mediaUrl).pathname)).status, 200);
+    assert.equal((await f.request('GET', `/v1/sessions/${old.id}/status`)).status, 410);
+    assert.equal(f.helper.records.size, 1);
+});
+
+test('an active peer and a temporary HTTP reconnect remain protected through the idle grace', async t => {
+    let now = 1000;
+    const f = await fixture(t, { now: () => now, keepMediaOpen: true });
+    const a = await f.open('A'), b = await f.open('B');
+    const first = await viewed(f, a), peer = await viewed(f, b);
+    await closedViewer(f, a, first);
+    now += 4000;
+    const reconnected = await viewed(f, a);
+    now += 6000; await f.helper.prune();
+    assert.equal(f.helper.records.size, 2);
+    await closedViewer(f, a, reconnected);
+    now += 4999; await f.helper.prune();
+    assert.equal(f.helper.records.size, 2);
+    now += 1; await f.helper.prune();
+    assert.ok(!f.helper.records.has(a.id)); assert.ok(f.helper.records.has(b.id));
+    assert.ok(!f.managers.at(-1).stops.includes('FIXTURE_CAMERA_B'));
+    await closedViewer(f, b, peer);
+});
+
+test('a still-starting source has a bounded first-view deadline while pending media HTTP is protected', async t => {
+    let now = 1000;
+    const f = await fixture(t, { now: () => now, autoReady: false });
+    const pending = await f.open('A');
+    now += 30000; await f.helper.prune();
+    assert.ok(f.helper.records.has(pending.id), 'initial camera startup was retired before the first-view deadline');
+    const response = fetch(pending.mediaUrl, { signal: AbortSignal.timeout(4000) }); response.catch(() => {});
+    for (let index = 0; index < 20 && !f.helper.records.get(pending.id).viewers.size; index++) await turn();
+    assert.equal(f.helper.records.get(pending.id).viewers.size, 1);
+    now += 30000;
+    await f.request('POST', `/v1/sessions/${pending.id}/renew`, { owner: OWNER, epoch: f.epoch });
+    now += 20000; await f.helper.prune();
+    assert.ok(f.helper.records.has(pending.id), 'a pending HTTP viewer was mistaken for an abandoned callback');
+    f.managers.at(-1).sessions.get('FIXTURE_CAMERA_A').ready.resolve();
+    const ready = await response; assert.equal(ready.status, 200); await ready.arrayBuffer();
+    now += 5001; await f.helper.prune();
+    assert.equal((await f.request('GET', `/v1/sessions/${pending.id}/status`)).status, 410);
+});
+
+test('ready callbacks that never receive a first HTTP viewer retire after 75 seconds despite renewal', async t => {
+    let now = 1000;
+    const f = await fixture(t, { now: () => now });
+    const abandoned = await f.open();
+    now += 60000; await f.request('POST', `/v1/sessions/${abandoned.id}/renew`, { owner: OWNER, epoch: f.epoch });
+    now += 14999; await f.helper.prune(); assert.ok(f.helper.records.has(abandoned.id));
+    now += 1; await f.helper.prune();
+    assert.equal((await f.request('GET', `/v1/sessions/${abandoned.id}/status`)).status, 410);
+    assert.equal(f.helper.records.size, 0);
+});
+
+test('active snapshot capture prevents first-view retirement until capture completes', async t => {
+    let now = 1000;
+    const snapshotGate = deferred();
+    const f = await fixture(t, { now: () => now, snapshotGate });
+    const session = await f.open();
+    const response = fetch(`${f.origin}/v1/sessions/${session.id}/snapshot`, {
+        headers: { Authorization: `Bearer ${SECRET}` }, signal: AbortSignal.timeout(4000) }); response.catch(() => {});
+    for (let index = 0; index < 20 && !f.helper.records.get(session.id).snapshots; index++) await turn();
+    assert.equal(f.helper.records.get(session.id).snapshots, 1);
+    now += 60000; await f.request('POST', `/v1/sessions/${session.id}/renew`, { owner: OWNER, epoch: f.epoch });
+    now += 20000; await f.helper.prune(); assert.ok(f.helper.records.has(session.id));
+    snapshotGate.resolve();
+    const captured = await response; assert.equal(captured.status, 200); await captured.arrayBuffer();
+    await f.helper.prune();
+    assert.equal((await f.request('GET', `/v1/sessions/${session.id}/status`)).status, 410);
+});
+
+test('a backpressured snapshot remains protected until HTTP delivery finishes', async t => {
+    let now = 1000;
+    const jpeg = Buffer.alloc(8 * 1024 * 1024);
+    jpeg.writeUInt16BE(0xffd8, 0); jpeg.writeUInt16BE(0xffd9, jpeg.length - 2);
+    const f = await fixture(t, { now: () => now, snapshotBytes: jpeg });
+    const session = await f.open(), route = `/v1/sessions/${session.id}/snapshot`;
+    const received = deferred(); let outgoing;
+    const observe = (request, response) => { if (request.url === route) outgoing = response; };
+    f.helper.server.on('request', observe);
+    const request = http.get(`${f.origin}${route}`, { headers: { Authorization: `Bearer ${SECRET}` } }, received.resolve);
+    request.on('error', received.reject);
+    t.after(() => { request.destroy(); f.helper.server.removeListener('request', observe); });
+    const response = await received.promise;
+    t.after(() => response.destroy());
+    // No reader consumes the IncomingMessage yet. This full-size JPEG cannot
+    // finish writing through the loopback socket while its receiver is paused.
+    assert.equal(outgoing.writableEnded, true);
+    assert.equal(outgoing.writableFinished, false);
+    const record = f.helper.records.get(session.id);
+    assert.equal(record.snapshots, 1);
+    now += 60000; await f.request('POST', `/v1/sessions/${session.id}/renew`, { owner: OWNER, epoch: f.epoch });
+    now += 20000; await f.helper.prune();
+    assert.ok(f.helper.records.has(session.id), 'a snapshot delivering JPEG bytes was retired');
+    let bytes = 0;
+    await new Promise((resolve, reject) => { response.on('data', chunk => { bytes += chunk.length; });
+        response.once('end', resolve); response.once('error', reject); response.resume(); });
+    assert.equal(bytes, jpeg.length);
+    for (let index = 0; index < 20 && record.snapshots; index++) await turn();
+    assert.equal(record.snapshots, 0);
+    // A subsequent close event must not release the same snapshot twice.
+    outgoing.emit('close'); assert.equal(record.snapshots, 0);
+    await f.helper.prune();
+    assert.equal((await f.request('GET', `/v1/sessions/${session.id}/status`)).status, 410);
+});
+
+test('idle retirement returns terminal status only after confirmed cleanup and retains failed capacity', async t => {
+    let now = 1000;
+    const f = await fixture(t, { now: () => now });
+    const a = await f.open('A'); await (await viewed(f, a)).arrayBuffer();
+    for (const label of ['B', 'C', 'D']) await f.open(label);
+    const gate = deferred(); f.closeGates.set('FIXTURE_CAMERA_A', gate);
+    now += 5001;
+    const retiring = f.helper.prune(); retiring.catch(() => {});
+    for (let index = 0; index < 20 && !f.helper.records.get(a.id).closing; index++) await turn();
+    let statusSettled = false;
+    const status = f.request('GET', `/v1/sessions/${a.id}/status`).then(value => { statusSettled = true; return value; });
+    for (let index = 0; index < 10; index++) await turn();
+    assert.equal(statusSettled, false, 'the client received retirement proof while cleanup remained uncertain');
+    gate.reject(Error('Synthetic worker cleanup failure.')); await assert.rejects(retiring);
+    assert.equal((await status).status, 503);
+    assert.equal(f.helper.records.size, 4);
+    const fifth = await f.request('POST', '/v1/sessions', { owner: OWNER, epoch: f.epoch,
+        requestId: randomUUID(), deviceId: randomUUID(), metadata: metadata('E') });
+    assert.equal(fifth.status, 429);
+    f.closeGates.delete('FIXTURE_CAMERA_A'); await f.helper.prune();
+    assert.equal((await f.request('GET', `/v1/sessions/${a.id}/status`)).status, 410);
+    await f.open('E');
+});
+
+test('retired lease tombstones share the bounded request registry and never evict unexpired proof', async t => {
+    let now = 1000;
+    const f = await fixture(t, { now: () => now, serverOptions: { maxRequests: 2, requestTtlMs: 100 } });
+    const a = await f.open('A'), b = await f.open('B');
+    await (await viewed(f, a)).arrayBuffer(); await (await viewed(f, b)).arrayBuffer();
+    now += 5001; await f.helper.prune(); assert.equal(f.helper.idleRetired.size, 2);
+    const full = await f.request('POST', '/v1/sessions', { owner: OWNER, epoch: f.epoch,
+        requestId: randomUUID(), deviceId: randomUUID(), metadata: metadata('C') });
+    assert.equal(full.status, 429);
+    assert.equal((await f.request('GET', `/v1/sessions/${a.id}/status`)).status, 410);
+    now += 101; await f.helper.prune();
+    assert.equal(f.helper.idleRetired.size, 0); await f.open('C');
+});
+
+test('idle retirement proof remains valid for 120 seconds after delayed cleanup is confirmed', async t => {
+    let now = 1000;
+    const f = await fixture(t, { now: () => now });
+    const session = await f.open(); await (await viewed(f, session)).arrayBuffer();
+    const gate = deferred(); f.closeGates.set('FIXTURE_CAMERA_A', gate);
+    now += 5001;
+    const retiring = f.helper.prune(); retiring.catch(() => {});
+    for (let index = 0; index < 20 && !f.helper.records.get(session.id).closing; index++) await turn();
+    gate.reject(Error('Synthetic delayed cleanup.')); await assert.rejects(retiring);
+    now += 120001;
+    assert.ok(f.helper.records.has(session.id), 'failed cleanup lost its source reservation');
+    f.closeGates.delete('FIXTURE_CAMERA_A'); await f.helper.prune();
+    assert.equal((await f.request('GET', `/v1/sessions/${session.id}/status`)).status, 410);
+    now += 119999;
+    assert.equal((await f.request('GET', `/v1/sessions/${session.id}/status`)).status, 410);
+    now += 1;
+    assert.equal((await f.request('GET', `/v1/sessions/${session.id}/status`)).status, 404);
+});
+
+test('recovery cancellation receives terminal idle proof rather than permission to create another source', async t => {
+    let now = 1000;
+    const f = await fixture(t, { now: () => now });
+    const requestId = randomUUID(), deviceId = randomUUID();
+    const session = await f.open('A', { requestId, deviceId });
+    await (await viewed(f, session)).arrayBuffer();
+    now += 5001; await f.helper.prune();
+    const recovery = await f.request('DELETE', `/v1/requests/${requestId}`, { owner: OWNER, epoch: f.epoch, deviceId });
+    assert.equal(recovery.status, 410);
+    const wrongBinding = await f.request('DELETE', `/v1/requests/${requestId}`, { owner: OWNER, epoch: f.epoch, deviceId: randomUUID() });
+    assert.equal(wrongBinding.status, 409);
+    assert.equal(f.managers.at(-1).starts.length, 1);
+    assert.equal(f.helper.records.size, 0);
+    await f.open('A', { deviceId });
+});
+
+test('joining an in-progress idle close also returns terminal proof after cleanup', async t => {
+    let now = 1000;
+    const f = await fixture(t, { now: () => now });
+    const requestId = randomUUID(), deviceId = randomUUID();
+    const session = await f.open('A', { requestId, deviceId }); await (await viewed(f, session)).arrayBuffer();
+    const gate = deferred(); f.closeGates.set('FIXTURE_CAMERA_A', gate);
+    now += 5001;
+    const retiring = f.helper.prune(); retiring.catch(() => {});
+    for (let index = 0; index < 20 && !f.helper.records.get(session.id).idleRetiring; index++) await turn();
+    const joining = f.helper.cancel(requestId, { owner: OWNER, epoch: f.epoch, deviceId }); joining.catch(() => {});
+    gate.resolve(); await retiring;
+    await assert.rejects(joining, error => error.status === 410);
+    assert.equal(f.helper.records.size, 0);
+});
+
+test('idle retirement rechecks viewers and snapshots after waiting in the mutation queue', async t => {
+    let now = 1000;
+    const f = await fixture(t, { now: () => now, keepMediaOpen: true });
+    const session = await f.open('A'), response = await viewed(f, session);
+    await closedViewer(f, session, response);
+    const gate = deferred(); const blocking = f.helper.mutate(() => gate.promise);
+    now += 5001; const queued = f.helper.prune();
+    const reconnected = await viewed(f, session);
+    gate.resolve(); await blocking; await queued;
+    assert.ok(f.helper.records.has(session.id), 'a viewer arriving while retirement was queued was ignored');
+
+    const captureGate = deferred(); f.snapshotGate = captureGate;
+    const snapshotSession = await f.open('B');
+    now += 60000; await f.request('POST', `/v1/sessions/${snapshotSession.id}/renew`, { owner: OWNER, epoch: f.epoch });
+    now += 15000;
+    const queueGate = deferred(); const otherBlocking = f.helper.mutate(() => queueGate.promise);
+    const snapshotPrune = f.helper.prune();
+    const capture = fetch(`${f.origin}/v1/sessions/${snapshotSession.id}/snapshot`, {
+        headers: { Authorization: `Bearer ${SECRET}` }, signal: AbortSignal.timeout(4000) }); capture.catch(() => {});
+    for (let index = 0; index < 20 && !f.helper.records.get(snapshotSession.id).snapshots; index++) await turn();
+    assert.equal(f.helper.records.get(snapshotSession.id).snapshots, 1);
+    queueGate.resolve(); await otherBlocking; await snapshotPrune;
+    assert.ok(f.helper.records.has(snapshotSession.id), 'a snapshot arriving while retirement was queued was ignored');
+    captureGate.resolve(); const captured = await capture; assert.equal(captured.status, 200); await captured.arrayBuffer();
+    await f.helper.prune();
+    await reconnected.body.cancel();
 });
