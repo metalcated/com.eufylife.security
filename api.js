@@ -10,8 +10,12 @@ function wall(homey) {
 
 // Authenticated Homey API only. Diagnostics contain neither media URLs nor cloud records.
 module.exports = {
+    async getCameraHelperStatus({ homey }) {
+        return homey.app.FfmpegManager.helperClient.health();
+    },
     async getCameraStatus({ homey }) {
         const manager = homey.app.FfmpegManager;
+        await manager?.refreshHelperStatus?.();
         return (homey.app.deviceList || []).filter(device => manager?.supports(device.EufyDevice)).map(device => ({
             name: device.getName(),
             id: device.getId(),

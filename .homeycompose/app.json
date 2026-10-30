@@ -1,7 +1,8 @@
 {
   "id": "com.eufylife.security",
-  "version": "3.44.7",
+  "version": "3.45.0",
   "api": {
+    "getCameraHelperStatus": { "method": "GET", "path": "/camera-helper", "public": false },
     "getCameraStatus": {
       "method": "GET",
       "path": "/cameras/status",

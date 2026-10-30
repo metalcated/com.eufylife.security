@@ -101,3 +101,11 @@ build/
 eufy-homey-client
 drivers/**/pair
 drivers/**/repair
+
+# Helper deployment state and Python validation caches
+__pycache__/
+*.pyc
+deploy/media-helper/runtime.env
+deploy/media-helper/current-release.json
+deploy/media-helper/releases/
+deploy/media-helper/.update.lock

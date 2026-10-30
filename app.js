@@ -458,7 +458,11 @@ class App extends Homey.App {
 
     async resetEufyClient() {
         this.eufyEventsHelper?.dispose();
-        await this.FfmpegManager?.reset();
+        try { await this.FfmpegManager?.reset(); }
+        catch (error) {
+            if (error?.cameraHelper !== true) throw error;
+            this.warn('Camera helper cleanup is pending; continuing the Eufy account reconnect.');
+        }
         if (this.eufyClient) {
             this.warn('resetEufyClient - Resetting EufyClient');
             this.eufyClient.close();
@@ -571,9 +575,11 @@ class App extends Homey.App {
 
     async onUninit() {
         this.eufyEventsHelper?.dispose();
-        await this.cameraWall?.dispose?.();
-        await this.FfmpegManager?.dispose();
-        this.eufyClient?.close?.();
+        try { await this.cameraWall?.dispose?.(); }
+        finally {
+            try { await this.FfmpegManager?.dispose(); }
+            finally { this.eufyClient?.close?.(); }
+        }
     }
 
     async copyUserdataFile(file) {

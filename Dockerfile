@@ -18,12 +18,14 @@ RUN npm ci --omit=dev --no-audit --no-fund \
 FROM dependencies AS verified
 COPY . .
 RUN npm test \
+    && node --test helper/config.test.cjs \
     && homey app validate --level debug \
     && homey app build \
     && node scripts/check-media.cjs
 RUN --network=none node scripts/check-p2p-lifecycle.cjs \
     && node scripts/check-owned-p2p-lifecycle.cjs \
     && node scripts/check-native-video-rsa.cjs
+RUN --network=none node scripts/check-camera-helper.cjs
 
 FROM verified AS installer
 RUN node scripts/check-package.cjs

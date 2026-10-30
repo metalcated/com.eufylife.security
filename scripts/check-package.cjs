@@ -35,6 +35,7 @@ async function main() {
                 'lib/helpers/camera-p2p-session.helper.js', 'lib/helpers/camera-p2p-worker.js',
                 'lib/helpers/camera-p2p-owned-session.helper.js',
                 'lib/helpers/camera-native-video-rsa.helper.js',
+                'lib/helpers/camera-helper-client.helper.js',
                 'settings/index.html', 'settings/camera-wall.js', 'settings/camera-wall.css',
                 'node_modules/eufy-security-client/build/index.js', 'node_modules/homey-api/index.js']) {
                 assert(files.includes(required), `Missing runtime file: ${required}`);
@@ -46,7 +47,7 @@ async function main() {
             }
             assert(files.some(file => /^node_modules\/eufy-security-client\/build\/.*\.proto$/.test(file)), 'Client protocol assets are missing');
             assert(files.some(file => /^node_modules\/eufy-security-client\/build\/.*\.crt$/.test(file)), 'Client certificate assets are missing');
-            assert(!files.some(file => /^(test|scripts|\.homeybuild|\.github|\.git|\.homey|\.homeycompose)\//.test(file)), 'Source or installer files leaked into the package');
+            assert(!files.some(file => /^(test|scripts|helper|deploy|\.homeybuild|\.github|\.git|\.homey|\.homeycompose)\//.test(file)), 'Source or installer files leaked into the package');
             const installerFiles = files.filter(file => /^node_modules\/(sharp|inquirer|dockerode|copyfiles)\//.test(file));
             assert.equal(installerFiles.length, 0, `Installer dependencies leaked into the package: ${installerFiles.slice(0, 4).join(', ')}`);
             // Homey injects its runtime SDK shim into this directory.

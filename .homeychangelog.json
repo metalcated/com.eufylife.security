@@ -1,4 +1,7 @@
 {
+  "3.45.0": {
+    "en": "Move selected P2P camera video and snapshots to an authenticated local media helper while retaining native Homey cameras, existing controls, and persistent update-compatible connection settings."
+  },
   "3.44.7": {
     "en": "Use native crypto for private camera video keys when supported, reduce concurrent video CPU overhead, and shed private video after sustained CPU warnings while preserving controls."
   },

@@ -193,6 +193,115 @@ function harness(t, options = {}) {
     return { manager, homey, homeyEvents, client, camera, deliver, calls, processes, timers, files, fileCalls, fileHandles, unlinkedFiles, fakeFs, servers, videos, fireTimer, adapters, settings };
 }
 
+function helperFixture(overrides = {}) {
+    const calls = [], statuses = new Map();
+    const helper = { calls, statuses,
+        selected: device => device.getId() === 'HOMEY_REMOTE', sourceCount: () => 0,
+        async videoUrl(device) { calls.push(['video', device.getId()]); return `http://127.0.0.1:8769/v1/media/${'a'.repeat(48)}.ts`; },
+        async snapshot(device) { calls.push(['snapshot', device.getId()]); return Buffer.from([0xff, 0xd8, 1, 2, 0xff, 0xd9]); },
+        async stop(serial) { calls.push(['stop', serial]); }, async reset() { calls.push(['reset']); },
+        async dispose() { calls.push(['dispose']); }, async refreshStatus() { calls.push(['refresh']); },
+        getStatus: serial => statuses.get(serial) || null, ...overrides };
+    return helper;
+}
+
+test('helper video retains the native camera slot and returns its direct media URL without creating in-app media', async t => {
+    const helper = helperFixture(); const h = harness(t, { managerOptions: { helperClient: helper } });
+    const camera = h.camera('REMOTE'); await h.manager.registerVideo(camera);
+    assert.equal(camera.registrations.length, 1); assert.equal(camera.registrations[0][0], 'main');
+    assert.equal(camera.registrations[0][1], 'Live');
+    const result = await h.videos[0].listener();
+    assert.equal(result.url, `http://127.0.0.1:8769/v1/media/${'a'.repeat(48)}.ts`);
+    assert.deepEqual(helper.calls, [['video', 'HOMEY_REMOTE']]);
+    assert.equal(h.processes.length, 0); assert.equal(h.servers.length, 0); assert.equal(h.adapters.length, 0);
+    assert.equal(h.calls.some(([name]) => name === 'resolve-binary' || name === 'start'), false);
+});
+
+test('a selected helper camera fails closed during an outage and an old in-app URL cannot start a replacement source', async t => {
+    const helper = helperFixture({ async videoUrl() { throw Object.assign(Error('Media helper is unavailable.'), { mediaPublic: true }); } });
+    const h = harness(t, { managerOptions: { helperClient: helper } }); const camera = h.camera('REMOTE');
+    await h.manager.registerVideo(camera);
+    await assert.rejects(h.videos[0].listener(), /helper is unavailable/);
+    await assert.rejects(h.manager.getSession(camera), /uses the media helper/);
+    assert.equal(h.processes.length, 0); assert.equal(h.adapters.length, 0); assert.equal(h.servers.length, 0);
+    assert.equal(h.calls.some(([name]) => name === 'start' || name === 'resolve-binary'), false);
+});
+
+test('selected native RTSP cameras retain their existing path and helper snapshots publish atomically without a local decoder', async t => {
+    const helper = helperFixture({ selected: () => true });
+    const h = harness(t, { managerOptions: { helperClient: helper } });
+    const native = h.camera('NATIVE', 'BASE', { native: true, values: { rtspStreamUrl: 'rtsp://fixture-camera/live' } });
+    await h.manager.registerVideo(native);
+    assert.deepEqual(await h.videos[0].listener(), { url: 'rtsp://fixture-camera/live' });
+    assert.equal(helper.calls.length, 0);
+    const remote = h.camera('REMOTE');
+    await h.manager.requestSnapshot(remote);
+    assert.deepEqual(remote.images, [['snapshot', 'REMOTE']]);
+    assert.deepEqual(h.files.get('/virtual/camera-tests/REMOTE_snapshot.jpg'), Buffer.from([0xff, 0xd8, 1, 2, 0xff, 0xd9]));
+    assert.equal(h.fileHandles[0].flags, 'wx'); assert.equal(h.fileHandles[0].mode, 0o600);
+    assert.equal(h.processes.length, 0); assert.equal(h.adapters.length, 0);
+});
+
+test('reset while a helper snapshot is pending preserves the old image and does not publish a late response', async t => {
+    const jpeg = deferred(); const helper = helperFixture({ snapshot: () => jpeg.promise });
+    const h = harness(t, { managerOptions: { helperClient: helper } }); const remote = h.camera('REMOTE');
+    const old = Buffer.from('old snapshot'); h.files.set('/virtual/camera-tests/REMOTE_snapshot.jpg', old);
+    const request = h.manager.requestSnapshot(remote); await flush();
+    const rejected = assert.rejects(request, /cancelled/); await h.manager.reset();
+    jpeg.resolve(Buffer.from([0xff, 0xd8, 1, 2, 0xff, 0xd9])); await rejected;
+    assert.equal(h.files.get('/virtual/camera-tests/REMOTE_snapshot.jpg'), old);
+    assert.equal(remote.images.length, 0); assert.equal(h.processes.length, 0);
+});
+
+test('helper reservations share the global source cap with legacy media and a single-camera Stop preserves peer leases', async t => {
+    const helper = helperFixture({ sourceCount: () => 3 });
+    const h = harness(t, { managerOptions: { helperClient: helper } });
+    const legacy = h.camera('LEGACY', 'BASE_A'); await h.manager.getSession(legacy); await h.deliver(legacy);
+    assert.equal(h.manager.sourceCount(), 4);
+    await assert.rejects(h.manager.getSession(h.camera('EXTRA', 'BASE_B')), /4 active camera/);
+    await h.manager.stopStream('REMOTE');
+    assert.deepEqual(helper.calls, [['stop', 'REMOTE']]);
+    assert.equal(h.manager.sessions.has('LEGACY'), true);
+    assert.equal(h.calls.some(([name]) => name === 'stop'), false);
+});
+
+test('helper cleanup failure cannot prevent local shutdown or unregistering native camera videos', async t => {
+    let unavailable = true;
+    const fail = () => { if (unavailable) throw Object.assign(Error('Helper cleanup unavailable.'), { cameraHelper: true, mediaPublic: true }); };
+    const helper = helperFixture({ async stop() { fail(); }, async reset() { fail(); }, async dispose() { fail(); } });
+    const h = harness(t, { managerOptions: { helperClient: helper } }); const legacy = h.camera('LEGACY');
+    await h.manager.registerVideo(legacy); await h.manager.getSession(legacy); const media = await h.deliver(legacy);
+    await assert.rejects(h.manager.dispose(), error => error.cameraHelper === true);
+    assert.equal(media.video.destroyed, true); assert.ok(media.proc.kills.length);
+    assert.equal(h.videos[0].unregisterCount, 1); assert.equal(h.manager.videos.size, 0);
+    assert.equal(h.manager.sessions.size, 0);
+    unavailable = false;
+});
+
+test('retired helper history cannot hide current legacy playback or a camera switched to direct native RTSP', async t => {
+    const helper = helperFixture({ selected: () => false });
+    helper.statuses.set('LEGACY', { state: 'stopped', source: 'helper', error: 'Old helper error' });
+    helper.statuses.set('NATIVE', { state: 'stopped', source: 'helper', error: 'Old helper error' });
+    const h = harness(t, { managerOptions: { helperClient: helper } });
+    const legacy = h.camera('LEGACY'); await h.manager.registerVideo(legacy);
+    await h.manager.getSession(legacy); await h.deliver(legacy);
+    assert.equal(h.manager.getStatus('LEGACY').state, 'streaming'); assert.equal(h.manager.getStatus('LEGACY').source, 'p2p');
+    const native = h.camera('NATIVE', 'BASE', { native: true, values: { rtspStreamUrl: 'rtsp://fixture-camera/live' } });
+    await h.manager.registerVideo(native);
+    assert.deepEqual(h.manager.getStatus('NATIVE'), { state: 'idle' });
+});
+
+test('a faster helper failure cannot mask a local source cleanup failure during account reset', async t => {
+    let failing = true;
+    const helper = helperFixture({ async stop() { if (failing) throw Object.assign(Error('Helper unavailable'), { cameraHelper: true }); } });
+    const h = harness(t, { isolated: true, managerOptions: { helperClient: helper },
+        closeAdapter: () => { if (failing) throw Error('Local private transport did not close'); } });
+    const camera = h.camera('LEGACY'); await h.manager.getSession(camera); await h.deliver(camera);
+    await assert.rejects(h.manager.stopStream('LEGACY'), error => error.cameraHelper !== true && /private camera connection could not be closed/.test(error.message));
+    failing = false; await h.manager.stopStream('LEGACY');
+    assert.equal(h.manager.sourceCount(), 0);
+});
+
 test('same-camera requests share one upstream and become ready only after complete TS packets', async (t) => {
     const h = harness(t);
     const camera = h.camera();

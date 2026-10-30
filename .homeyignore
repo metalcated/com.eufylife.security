@@ -5,6 +5,8 @@
 .homeybuild/
 test/
 scripts/
+helper/
+deploy/
 Dockerfile
 .dockerignore
 .gitignore

@@ -138,3 +138,40 @@ Physical-device validation remains necessary. After installing on a Homey test i
 The 2026-10-30 trial used Homey Self-Hosted 13.5.3 with 8 GiB VM RAM and four vCPUs. The installed app runtime was Node 22.23.4 / OpenSSL 3.5.9, and both Garage and Doorbell reported native video decryption while delivering full-resolution P2P video. Sustained concurrent playback still exceeded Homey's fixed app CPU budget, so the CPU safeguard stopped the private sources while leaving Eufy running. Browser video clocks continued advancing on the final frame; they are not proof that an upstream remains live. Use fresh `/cameras/status` source state and increasing byte counts alongside decoded video when validating playback.
 
 The temporary concurrent rollout was disabled after this trial. Native RTSP and the existing single-connection P2P path remain available. Additional VM memory/CPU did not remove the app watchdog constraints. Concurrent P2P playback is experimental and has not passed sustained live acceptance on this installation; the next design decision is whether to move media processing outside the Homey app or reduce camera stream settings with the owner's approval.
+
+## External media helper (3.45.0)
+
+The optional media helper moves selected P2P camera sessions, FFmpeg, and JPEG decoding into a separate Docker container. Homey continues registering the same Eufy-owned camera device and `main` video slot through its supported SDK. Native RTSP retains its direct path. Account credentials and cloud authentication remain in the Eufy app; the helper receives only scoped camera metadata and the bounded read-only handshake responses required for that camera.
+
+The helper binds to `127.0.0.1` on the same Linux VM as Homey. Control requests require its persistent private key; video URLs carry a separate opaque media capability. Neither is exposed by the diagnostic API. An active, current lease is required even when an existing media URL is known. Homey validates camera privacy, paired-device identity, Station identity, client identity, and selected-device scope before supplying keys and renewing a lease. Leases last at most 75 seconds without renewal. Explicit Stop, privacy changes, app epoch changes, and cancellation close the camera independently of its peers. At most four pending, active, or closing relayed sources are reserved across the app and helper; native RTSP bypasses this relay count.
+
+`camera_helper_connection` and `camera_helper_devices` are separate Homey app settings, outside the logged Eufy account configuration. A configured camera that cannot reach its helper reports a camera error instead of silently starting expensive concurrent video inside Homey. Ordinary device controls, events, and account reconnection retain their existing paths. The helper uses the existing bounded Worker adapter and terminates each owned Worker during cleanup. It does not patch Homey's image, runtime, watchdog, or source.
+
+### Installation and connection
+
+The helper deployment files are under `deploy/media-helper/`. Build a reviewed Linux amd64 image from `deploy/media-helper/Dockerfile`; `HELPER_DEPENDENCY_IMAGE` identifies the tested local installer image containing the pinned production dependency tree. That tree contains no native addons. The runtime uses a fixed Node release and Debian FFmpeg, and the actual target image is validated separately from the native build-host installer.
+
+On the VM, place `compose.yaml`, `example.env`, `healthcheck.cjs`, and `manage.py` in a dedicated directory such as `/opt/homey-eufy-media-helper`. The first installation needs a mode-0600 bootstrap file containing 64 lowercase hexadecimal characters. Supply that file only to the management and connection tools; never paste the key into a browser or commit it. With the reviewed image already loaded into Docker, apply it with:
+
+```bash
+sudo python3 /opt/homey-eufy-media-helper/manage.py \
+  --image metalcated/homey-eufy-media-helper:0.1.0 \
+  --image-id sha256:REVIEWED_IMAGE_ID \
+  --seed-token /private/path/to/bootstrap.key
+```
+
+The manager is restricted to the dedicated `homey-eufy-media-helper` Compose project and labeled external data volume. It verifies the exact image identity, Linux amd64 platform, protocol, SDK, and release labels before changing the container. Runtime configuration uses the immutable image ID. The key remains in the dedicated volume; later updates omit `--seed-token` and preserve it. Compose supplies restart behavior, a read-only root filesystem, dropped capabilities, bounded logs, a 1 GiB memory limit, and a two-CPU limit by default. Ports and resource limits are configured through `runtime.env`; that file contains no secret.
+
+After installing the matching Eufy fork with the usual data-preserving installer, run `scripts/connect-helper.cjs` in the authenticated installer image. Set `HOMEY_ID`, the optional `HOMEY_INSTALL_URL`, and `EUFY_MEDIA_TOKEN_FILE` to the read-only bootstrap file mount. `EUFY_MEDIA_ORIGIN` defaults to `http://127.0.0.1:8769`; `EUFY_MEDIA_DEVICE_IDS` optionally selects a JSON array of existing Eufy camera device IDs. Otherwise all eligible Eufy camera devices are selected, with native RTSP still taking its direct path. The connection tool checks the installed fork version, camera ownership and registrations, and authenticated helper health from Homey before enabling delegation. An existing different identity is never overwritten. Failed setup restores the previous selection and removes only a newly added connection.
+
+### Updates and rollback
+
+Homey server updates preserve installed app code and settings in Homey's persistent user volume. The helper has its own container and external data volume. Its stored key derives stable camera links, and the Homey client automatically revalidates and restores desired leases after a helper restart. No camera pairing or dashboard replacement is part of an ordinary compatible update.
+
+The current Homey updater excludes development-installed apps from routine App Store update checks. Keep this fork and merge/test upstream Eufy changes into it. Explicitly installing the official Store version over the same app ID can replace the helper bridge. Upstream protocol, SDK, and Homey breaking changes still require compatibility work; persistence is not a guarantee that an arbitrary future version is compatible.
+
+App/helper protocol version 1 and the pinned Eufy SDK 4.2.6 are negotiated before camera creation. Incompatible versions fail before starting a source. The management tool keeps before/accepted release records and verifies authenticated health after recreation. A failed update automatically restores the previous image and environment. An explicit rollback uses the prior recorded image ID for both `--image` and `--image-id`. Keep those images and back up both Homey's user volume and the helper data volume. The updater never prunes images or deletes the external data volume.
+
+The authenticated Eufy API `GET /camera-helper` reports only configuration, availability, protocol, version, SDK, and instance identity. `GET /cameras/status` refreshes bounded helper status and reports source state and byte counts without keys, cloud records, or media URLs. Increasing byte counts and successful decoding are the live validation signals; a browser video clock alone can advance on a stopped frame.
+
+The account-free helper integration check is `scripts/check-camera-helper.cjs`. It exercises the actual client and HTTP service, real SDK Workers and UDP lifecycle, permitted handshake RPC, generated H.264/HEVC decoding and snapshots, privacy cancellation, app-client recreation, helper recreation, incompatible-update rejection, rollback, and final resource cleanup. Live camera endurance and VM deployment checks remain separate evidence.

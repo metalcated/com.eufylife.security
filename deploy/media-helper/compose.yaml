@@ -1,0 +1,36 @@
+name: ${EUFY_MEDIA_PROJECT_NAME:-homey-eufy-media-helper}
+services:
+  media-helper:
+    image: ${EUFY_MEDIA_IMAGE:?Set the tested helper release image}
+    pull_policy: never
+    container_name: ${EUFY_MEDIA_CONTAINER_NAME:-homey-eufy-media-helper}
+    network_mode: host
+    restart: unless-stopped
+    init: true
+    read_only: true
+    user: "1000:1000"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: ${EUFY_MEDIA_MEMORY_LIMIT:-1g}
+    cpus: ${EUFY_MEDIA_CPU_LIMIT:-2.0}
+    pids_limit: 256
+    environment:
+      EUFY_MEDIA_BIND: 127.0.0.1
+      EUFY_MEDIA_PORT: ${EUFY_MEDIA_PORT:-8769}
+      EUFY_MEDIA_SECRET_FILE: /data/auth.key
+      EUFY_MEDIA_CACHE_DIR: /cache
+      EUFY_MEDIA_FFMPEG: /usr/bin/ffmpeg
+    volumes:
+      - helper-data:/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,uid=1000,gid=1000
+      - /cache:rw,noexec,nosuid,size=128m,uid=1000,gid=1000
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "2"
+volumes:
+  helper-data:
+    name: ${EUFY_MEDIA_DATA_VOLUME:-homey-eufy-media-helper-data}
+    external: true
