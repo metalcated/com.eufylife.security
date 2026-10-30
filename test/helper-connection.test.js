@@ -34,7 +34,7 @@ function harness(options = {}) {
     if (Object.hasOwn(options, 'selection')) settings.set('camera_helper_devices', clone(options.selection));
     const state = { calls, settings, tokenFile: keyFile(), installed: { id: APP, version: manifest.version, state: 'running' },
         cameras: [{ id: DEVICE_A, name: 'Camera A', videoRegistered: true }, { id: DEVICE_B, name: 'Camera B', videoRegistered: true }],
-        devices: { [DEVICE_A]: { id: DEVICE_A, driverUri: `homey:app:${APP}` }, [DEVICE_B]: { id: DEVICE_B, driverUri: `homey:app:${APP}` } },
+        devices: { [DEVICE_A]: { id: DEVICE_A, driverId: `homey:app:${APP}:driver_EUFYCAM_2` }, [DEVICE_B]: { id: DEVICE_B, driverId: `homey:app:${APP}:driver_INDOOR_CAM` } },
         health: { configured: true, available: true, protocol: 1, version: '0.1.0', sdk: '4.2.6' }, selectionFailure: null };
     const homey = { apps: {
         async getApp(args) { calls.push(['getApp', clone(args)]); assert.equal(args.id, APP); return clone(state.installed); },
@@ -148,7 +148,7 @@ test('an unknown selection-write outcome restores its baseline and rolls back on
 test('foreign device ownership, unregistered cameras, empty inventory and non-camera selections fail before mutation', async () => {
     for (const mode of ['foreign', 'unregistered', 'empty', 'selection']) {
         const h = harness();
-        if (mode === 'foreign') h.devices[DEVICE_A].driverUri = 'homey:app:another.camera';
+        if (mode === 'foreign') h.devices[DEVICE_A].driverId = 'homey:app:another.camera:camera';
         if (mode === 'unregistered') h.cameras[0].videoRegistered = false;
         if (mode === 'empty') h.cameras = [];
         const selection = mode === 'selection' ? ['00000000-0000-4000-8000-000000000099'] : true;

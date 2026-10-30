@@ -23,7 +23,8 @@ async function connectHelper({ homey, tokenFile, origin = 'http://127.0.0.1:8769
         homey.call({ method: 'GET', path: `/api/app/${APP}/cameras/status` }),
     ]);
     if (!Array.isArray(cameras) || !cameras.length || cameras.some(camera => !camera.videoRegistered
-        || devices[camera.id]?.driverUri !== `homey:app:${APP}`)) throw Error('Eufy camera registrations are not ready');
+        || typeof devices[camera.id]?.driverId !== 'string'
+        || !devices[camera.id].driverId.startsWith(`homey:app:${APP}:`))) throw Error('Eufy camera registrations are not ready');
     if (Array.isArray(selection) && selection.some(id => !cameras.some(camera => camera.id === id))) throw Error('A selected camera does not belong to this Eufy app');
     const name = 'camera_helper_connection';
     const [previous, previousSelection] = await Promise.all([
