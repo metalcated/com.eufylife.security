@@ -68,6 +68,9 @@ function harness(t, options = {}) {
     const unlinkedFiles = [];
     const servers = [];
     const videos = [];
+    const adapters = [];
+    const settings = new Map();
+    if (Object.hasOwn(options, 'isolated')) settings.set('camera_isolated_p2p_devices', options.isolated);
     const fakeFs = { promises: {
         async open(file, flags, mode) {
             if (files.has(file)) throw Object.assign(Error('Test file already exists'), { code: 'EEXIST' });
@@ -104,9 +107,11 @@ function harness(t, options = {}) {
         videos.push(video);
         return video;
     };
-    const homey = { platformVersion: 2, app: { eufyClient: client, log() {}, debug() {}, error() {}, warn() {} },
+    const homeyEvents = new EventEmitter();
+    const homey = Object.assign(homeyEvents, { platformVersion: 2, app: { eufyClient: client, log() {}, debug() {}, error() {}, warn() {} },
+        settings: { get: key => settings.get(key), set: (key, value) => settings.set(key, value) },
         videos: { createVideoRTSP: () => createVideo('rtsp'), createVideoOther: (config) => createVideo('other', config) }
-    };
+    });
     const nativeRequire = createRequire(filename);
     const localRequire = (request) => {
         if (request === 'eufy-security-client') return { CommandName, PropertyName, VideoCodec };
@@ -115,10 +120,12 @@ function harness(t, options = {}) {
         return nativeRequire(request);
     };
     const module = { exports: {} };
-    const factory = vm.runInThisContext(`(function(require,module,exports,__filename,__dirname,setTimeout,clearTimeout) {\n${fs.readFileSync(filename, 'utf8')}\n})`, { filename });
-    factory(localRequire, module, module.exports, filename, path.dirname(filename), setTimer, clearTimer);
+    const factory = vm.runInThisContext(`(function(require,module,exports,__filename,__dirname,setTimeout,clearTimeout,Date) {\n${fs.readFileSync(filename, 'utf8')}\n})`, { filename });
+    const clock = options.now ? class extends Date { static now() { return options.now(); } } : Date;
+    factory(localRequire, module, module.exports, filename, path.dirname(filename), setTimer, clearTimer, clock);
     const Manager = module.exports;
     const manager = new Manager(homey, {
+        ...(options.productionDefaults ? {} : { preferSharedP2P: false }),
         userdata: '/virtual/camera-tests', startTimeoutMs: 101, snapshotTimeoutMs: 102, idleTimeoutMs: 103, maxDurationMs: 104,
         resolveBinary: async () => { calls.push(['resolve-binary']); return options.resolveBinary ? options.resolveBinary() : '/virtual/ffmpeg'; },
         spawn: (command, args, options) => { const proc = fakeProcess(command, args); proc.options = options; processes.push(proc); return proc; },
@@ -130,6 +137,15 @@ function harness(t, options = {}) {
             server.close = (done) => { server.closed = true; queueMicrotask(done); };
             servers.push(server);
             return server;
+        },
+        createP2PSession: (params) => {
+            const serial = params.homeyDevice.EufyDevice.getSerial();
+            const adapter = { params, serial, starts: 0, closes: 0,
+                async start() { this.starts++; calls.push(['private-start', serial]); if (options.startAdapter) return options.startAdapter(this); },
+                async close() { this.closes++; calls.push(['private-close', serial]); if (options.closeAdapter) return options.closeAdapter(this); }
+            };
+            adapters.push(adapter);
+            return adapter;
         },
         ...options.managerOptions
     });
@@ -147,6 +163,7 @@ function harness(t, options = {}) {
         };
         if (Object.hasOwn(settings, 'battery')) device.hasBattery = () => settings.battery;
         const homeyDevice = { EufyDevice: device, _started: true, values, registrations: [], images: [],
+            getId: () => settings.homeyId || `HOMEY_${serial}`,
             EufyStation: { startRTSPStream: () => calls.push(['native-start', serial]) },
             async setCameraVideo(...args) { this.registrations.push(args); },
             async updateImage(...args) { this.images.push(args); }
@@ -158,8 +175,10 @@ function harness(t, options = {}) {
         await flush();
         const video = new PassThrough();
         const audio = new PassThrough();
-        await manager.streamHandler(video, audio, cameraDevice.EufyDevice, cameraDevice.EufyStation, metadata);
-        const proc = processes.findLast((candidate) => candidate.args.includes('mpegts') && !candidate.args.includes('image2pipe'));
+        const adapter = adapters.findLast(candidate => candidate.serial === cameraDevice.EufyDevice.getSerial());
+        if (adapter) await adapter.params.onStream(video, audio, metadata);
+        else await manager.streamHandler(video, audio, cameraDevice.EufyDevice, cameraDevice.EufyStation, metadata);
+        const proc = manager.sessions.get(cameraDevice.EufyDevice.getSerial())?.process;
         if (bytes) proc.stdout.emit('data', bytes);
         await flush();
         return { proc, video, audio };
@@ -171,7 +190,7 @@ function harness(t, options = {}) {
         for (const timer of matching) { timers.delete(timer); timer.fn(); }
     }
 
-    return { manager, homey, client, camera, deliver, calls, processes, timers, files, fileCalls, fileHandles, unlinkedFiles, fakeFs, servers, videos, fireTimer };
+    return { manager, homey, homeyEvents, client, camera, deliver, calls, processes, timers, files, fileCalls, fileHandles, unlinkedFiles, fakeFs, servers, videos, fireTimer, adapters, settings };
 }
 
 test('same-camera requests share one upstream and become ready only after complete TS packets', async (t) => {
@@ -194,6 +213,440 @@ test('same-camera requests share one upstream and become ready only after comple
     assert.equal(first.bytes, 188);
     assert.equal(first.tail.length, 0);
     assert.equal(h.manager.getStatus('CAMERA_A').state, 'streaming');
+});
+
+test('selected cameras on one HomeBase use separate sources and stopping one leaves the other delivering media', async t => {
+    const h = harness(t, { isolated: ['HOMEY_A', 'HOMEY_B'] });
+    const a = h.camera('A', 'SHARED'), b = h.camera('B', 'SHARED');
+    const originalStation = { startRTSPStream() {}, controlCalls: 0, setGuardMode() { this.controlCalls++; } };
+    a.EufyStation = originalStation; b.EufyStation = originalStation;
+    const [first, second] = await Promise.all([h.manager.getSession(a), h.manager.getSession(b)]);
+    await flush();
+    assert.equal(h.adapters.length, 2);
+    assert.notEqual(h.adapters[0], h.adapters[1]);
+    assert.equal(h.adapters.every(adapter => adapter.params.client === h.client), true);
+    assert.deepEqual(h.calls.filter(([name]) => name === 'private-start').map(([, serial]) => serial).sort(), ['A', 'B']);
+    assert.equal(h.calls.some(([name]) => name === 'start' || name === 'duration'), false, 'private sources do not operate the account client livestream');
+    const responseA = fakeResponse(), responseB = fakeResponse();
+    responseA._eufyReady = true; responseB._eufyReady = true;
+    first.consumers.add(responseA); second.consumers.add(responseB);
+    const packetA = transportPackets(); packetA[12] = 0x41;
+    const packetB = transportPackets(); packetB[12] = 0x42;
+    const mediaA = await h.deliver(a, packetA), mediaB = await h.deliver(b, packetB);
+    assert.notEqual(mediaA.proc, mediaB.proc);
+    mediaA.video.write(Buffer.from('camera-a-only')); mediaB.video.write(Buffer.from('camera-b-only'));
+    await flush();
+    assert.equal(Buffer.concat(mediaA.proc.inputs).toString(), 'camera-a-only');
+    assert.equal(Buffer.concat(mediaB.proc.inputs).toString(), 'camera-b-only');
+    assert.deepEqual(Buffer.concat(responseA.chunks), packetA);
+    assert.deepEqual(Buffer.concat(responseB.chunks), packetB);
+    await h.manager.stopStream('A');
+    assert.equal(mediaA.video.destroyed, true); assert.equal(responseA.destroyed, true);
+    assert.equal(h.adapters.find(adapter => adapter.serial === 'A').closes, 1);
+    assert.equal(h.adapters.find(adapter => adapter.serial === 'B').closes, 0);
+    assert.equal(mediaB.proc.kills.length, 0); assert.equal(mediaB.video.destroyed, false);
+    mediaB.proc.stdout.emit('data', packetB);
+    assert.equal(second.bytes, 376);
+    assert.deepEqual(Buffer.concat(responseB.chunks), Buffer.concat([packetB, packetB]));
+    assert.equal(a.EufyStation, originalStation); assert.equal(b.EufyStation, originalStation);
+    originalStation.setGuardMode(); assert.equal(originalStation.controlCalls, 1);
+    assert.equal(h.calls.some(([name]) => name === 'stop'), false);
+});
+
+test('shared-first mode uses one original Station and only an additional worker for concurrent cameras on that HomeBase', async t => {
+    const h = harness(t, { isolated: ['HOMEY_A', 'HOMEY_B'], productionDefaults: true });
+    const a = h.camera('A', 'SHARED'), b = h.camera('B', 'SHARED');
+    const original = { startRTSPStream() {}, controls: 0, setGuardMode() { this.controls++; } };
+    a.EufyStation = original; b.EufyStation = original;
+    const first = await h.manager.getSession(a), second = await h.manager.getSession(b);
+    const mediaA = await h.deliver(a), mediaB = await h.deliver(b);
+    assert.equal(first.isolated, false); assert.equal(second.isolated, true);
+    assert.equal(h.adapters.length, 1); assert.equal(h.adapters[0].serial, 'B');
+    assert.deepEqual(h.calls.filter(([name]) => name === 'start'), [['start', 'A']]);
+    assert.deepEqual([...h.manager.stationOwners], [['SHARED', 'A']]);
+    await h.manager.stopStream('A');
+    assert.equal(mediaA.video.destroyed, true); assert.ok(mediaA.proc.kills.length);
+    assert.equal(h.manager.sessions.get('B'), second);
+    assert.equal(mediaB.video.destroyed, false); assert.equal(mediaB.proc.kills.length, 0);
+    assert.equal(h.adapters[0].starts, 1); assert.equal(h.adapters[0].closes, 0, 'the worker is neither promoted nor restarted');
+    const reopened = await h.manager.getSession(a); await h.deliver(a);
+    assert.notEqual(reopened, first); assert.equal(reopened.isolated, false);
+    assert.equal(h.adapters.length, 1);
+    assert.deepEqual(h.calls.filter(([name]) => name === 'start'), [['start', 'A'], ['start', 'A']]);
+    await h.manager.sourceStopped(original, b.EufyDevice);
+    assert.equal(h.manager.sessions.get('B'), second, 'a global Station event cannot stop its private peer');
+    mediaB.proc.stdout.emit('data', transportPackets());
+    assert.equal(second.bytes, 376);
+    assert.equal(a.EufyStation, original); assert.equal(b.EufyStation, original);
+    original.setGuardMode(); assert.equal(original.controls, 1);
+});
+
+test('an isolated snapshot and live viewer of the same camera share one source while another camera stays live', async t => {
+    const h = harness(t, { isolated: true });
+    const a = h.camera('A', 'SHARED'), b = h.camera('B', 'SHARED');
+    const liveA = await h.manager.getSession(a), liveB = await h.manager.getSession(b);
+    const viewerA = fakeResponse(); viewerA._eufyReady = true; liveA.consumers.add(viewerA);
+    const mediaB = await h.deliver(b);
+    const snapshot = h.manager.requestSnapshot(a);
+    const sameSnapshot = h.manager.requestSnapshot(a);
+    const sameLive = await h.manager.getSession(a);
+    const mediaA = await h.deliver(a);
+    assert.equal(sameLive, liveA);
+    assert.equal(h.adapters.filter(adapter => adapter.serial === 'A').length, 1);
+    const decoders = h.processes.filter(proc => proc.args.includes('image2pipe'));
+    assert.equal(decoders.length, 1);
+    const jpeg = Buffer.from([0xff, 0xd8, 1, 2, 3, 0xff, 0xd9]);
+    decoders[0].stdout.emit('data', jpeg); decoders[0].complete(0);
+    assert.deepEqual(await Promise.all([snapshot, sameSnapshot]), [true, true]);
+    assert.equal(h.manager.sessions.get('A'), liveA);
+    assert.equal(h.manager.sessions.get('B'), liveB);
+    assert.equal(mediaA.proc.kills.length, 0); assert.equal(mediaB.proc.kills.length, 0);
+    assert.equal(h.adapters.every(adapter => adapter.closes === 0), true);
+    assert.deepEqual(a.images, [['snapshot', 'A']]);
+});
+
+test('a failed private source is cleaned independently and its stale callbacks cannot poison a retry', async t => {
+    const h = harness(t, { isolated: true });
+    const a = h.camera('A', 'SHARED'), b = h.camera('B', 'SHARED');
+    const first = await h.manager.getSession(a), other = await h.manager.getSession(b);
+    const mediaB = await h.deliver(b);
+    const old = h.adapters.find(adapter => adapter.serial === 'A');
+    old.params.onError(Error('private station failure'));
+    await assert.rejects(first.ready.promise);
+    await flush();
+    assert.equal(old.closes, 1);
+    assert.equal(h.manager.sessions.get('B'), other);
+    assert.equal(mediaB.proc.kills.length, 0);
+    const retry = await h.manager.getSession(a); await flush();
+    const current = h.adapters.findLast(adapter => adapter.serial === 'A');
+    assert.notEqual(current, old);
+    const staleVideo = new PassThrough(), staleAudio = new PassThrough();
+    await old.params.onStream(staleVideo, staleAudio, { videoCodec: VideoCodec.H264 });
+    old.params.onStop(); old.params.onError(Error('late old failure')); await flush();
+    assert.equal(staleVideo.destroyed, true); assert.equal(staleAudio.destroyed, true);
+    assert.equal(h.manager.sessions.get('A'), retry);
+    assert.equal(current.closes, 0);
+    await h.deliver(a); await retry.ready.promise;
+    assert.equal(h.manager.getStatus('A').state, 'streaming');
+});
+
+test('four private startup or closing sources reserve capacity until owned cleanup finishes', async t => {
+    const closing = deferred();
+    const h = harness(t, { isolated: true, startAdapter: () => new Promise(() => {}),
+        closeAdapter: adapter => adapter.serial === 'A' ? closing.promise : undefined });
+    for (const serial of ['A', 'B', 'C', 'D']) await h.manager.getSession(h.camera(serial, 'SHARED'));
+    await flush();
+    assert.equal(h.adapters.length, 4);
+    await assert.rejects(h.manager.getSession(h.camera('E', 'SHARED')), /4|active|limit/i);
+    const stopping = h.manager.stopStream('A'); await flush();
+    assert.equal(h.manager.sessions.size, 3);
+    await assert.rejects(h.manager.getSession(h.camera('E', 'SHARED')), /4|active|limit/i);
+    assert.equal(h.adapters.length, 4, 'closing transport resources continue to reserve a slot');
+    closing.resolve(); await stopping;
+    const next = await h.manager.getSession(h.camera('E', 'SHARED')); await flush();
+    assert.equal(next.serial, 'E'); assert.equal(h.adapters.length, 5);
+});
+
+test('private startup cancellation and disposal cannot dispatch late media or operate the account station', async t => {
+    for (const action of ['stop', 'reset', 'dispose']) await t.test(action, async subtest => {
+        const starting = deferred();
+        const h = harness(subtest, { isolated: true, startAdapter: () => starting.promise });
+        const camera = h.camera('A', 'SHARED');
+        const session = await h.manager.getSession(camera); await flush();
+        const adapter = h.adapters[0];
+        const rejected = assert.rejects(session.ready.promise);
+        if (action === 'stop') await h.manager.stopStream('A'); else await h.manager[action]();
+        await rejected;
+        starting.resolve(); await flush();
+        const video = new PassThrough(), audio = new PassThrough();
+        await adapter.params.onStream(video, audio, { videoCodec: VideoCodec.H264 });
+        assert.equal(video.destroyed, true); assert.equal(audio.destroyed, true);
+        assert.equal(adapter.closes, 1);
+        assert.equal(h.manager.sessions.size, 0);
+        assert.equal(h.processes.length, 0);
+        assert.equal(h.calls.some(([name]) => name === 'start' || name === 'stop' || name === 'duration'), false);
+    });
+});
+
+test('isolation is opt-in by Homey device ID and leaves native RTSP on its existing path', async t => {
+    const h = harness(t, { isolated: ['HOMEY_SELECTED', 'SERIAL_ONLY'] });
+    const selected = h.camera('SELECTED', 'SHARED');
+    const unselected = h.camera('SERIAL_ONLY', 'SHARED');
+    const native = h.camera('NATIVE', 'SHARED', { native: true, values: { [PropertyName.DeviceRTSPStreamUrl]: 'rtsp://fixture-camera/live' } });
+    await h.manager.getSession(selected); await h.manager.getSession(unselected); await h.manager.getSession(native); await flush();
+    assert.deepEqual(h.adapters.map(adapter => adapter.serial), ['SELECTED']);
+    assert.deepEqual(h.calls.filter(([name]) => name === 'start'), [['start', 'SERIAL_ONLY']]);
+    assert.equal(h.processes.some(proc => proc.args.includes('rtsp://fixture-camera/live')), true);
+    assert.equal(selected.EufyDevice.getSerial(), 'SELECTED');
+    assert.equal(h.manager.isolatedP2P(native), false);
+});
+
+test('a synchronous private factory failure and rejected private startup both release capacity for retry', async t => {
+    for (const phase of ['factory', 'start']) await t.test(phase, async subtest => {
+        let starts = 0;
+        const h = harness(subtest, { isolated: true, startAdapter: () => {
+            if (phase === 'start' && starts++ === 0) throw Error('private startup failure');
+        } });
+        const factory = h.manager.createP2PSession;
+        if (phase === 'factory') h.manager.createP2PSession = () => { throw Error('private construction failure'); };
+        const camera = h.camera('A', 'SHARED');
+        const failed = await h.manager.getSession(camera);
+        await assert.rejects(failed.ready.promise);
+        await flush();
+        assert.equal(h.manager.sourceCount(), 0);
+        if (phase === 'start') assert.equal(h.adapters[0].closes, 1);
+        h.manager.createP2PSession = factory;
+        const retry = await h.manager.getSession(camera);
+        await h.deliver(camera); await retry.ready.promise;
+        assert.equal(h.manager.getStatus('A').state, 'streaming');
+    });
+});
+
+test('global events retain exact legacy source ownership and cannot stop or inject a private session', async t => {
+    const h = harness(t, { isolated: ['HOMEY_PRIVATE'] });
+    const legacy = h.camera('LEGACY', 'SHARED'), isolated = h.camera('PRIVATE', 'SHARED');
+    const left = await h.manager.getSession(legacy), right = await h.manager.getSession(isolated);
+    await flush();
+    await assert.rejects(h.manager.getSession(h.camera('OTHER_LEGACY', 'SHARED')), /HomeBase|P2P|another|busy/i);
+    const injectedVideo = new PassThrough(), injectedAudio = new PassThrough();
+    await h.manager.streamHandler(injectedVideo, injectedAudio, isolated.EufyDevice, isolated.EufyStation, { videoCodec: VideoCodec.H264 });
+    assert.equal(injectedVideo.destroyed, true); assert.equal(injectedAudio.destroyed, true);
+    assert.equal(right.input, undefined);
+    await h.manager.sourceStopped(isolated.EufyStation, isolated.EufyDevice);
+    await h.manager.sourceStopped({}, legacy.EufyDevice);
+    assert.equal(h.manager.sessions.get('LEGACY'), left); assert.equal(h.manager.sessions.get('PRIVATE'), right);
+    await h.deliver(legacy); const media = await h.deliver(isolated);
+    await h.manager.sourceStopped(legacy.EufyStation, legacy.EufyDevice);
+    assert.equal(left.stopped, true); assert.equal(right.stopped, false);
+    assert.equal(media.proc.kills.length, 0);
+    assert.deepEqual(h.calls.filter(([name]) => name === 'stop'), [['stop', 'LEGACY']]);
+    assert.equal(h.adapters[0].closes, 0);
+});
+
+test('reset and disposal await every owned close even when a session was already removed', async t => {
+    for (const action of ['reset', 'dispose']) await t.test(action, async subtest => {
+        const aClose = deferred(), bClose = deferred();
+        const h = harness(subtest, { isolated: true, closeAdapter: adapter => adapter.serial === 'A' ? aClose.promise : bClose.promise });
+        await h.manager.getSession(h.camera('A', 'SHARED'));
+        await h.manager.getSession(h.camera('B', 'SHARED'));
+        await flush();
+        const stopping = h.manager.stopStream('A'); await flush();
+        let done = false;
+        const shutdown = h.manager[action]().then(() => { done = true; });
+        await flush();
+        assert.equal(done, false); assert.equal(h.manager.sourceCount(), 2);
+        aClose.resolve(); await stopping; await flush();
+        assert.equal(done, false, 'one completed cleanup must not release the other owned transport');
+        bClose.resolve(); await shutdown;
+        assert.equal(h.manager.sourceCount(), 0);
+        assert.equal(h.adapters.every(adapter => adapter.closes === 1), true);
+    });
+});
+
+test('failed private termination keeps its capacity reserved until an explicit cleanup retry succeeds', async t => {
+    let rejectClose = true;
+    const h = harness(t, { isolated: true, closeAdapter: adapter => {
+        if (adapter.serial === 'A' && rejectClose) throw Error('private worker termination secret');
+    } });
+    try {
+        for (const serial of ['A', 'B', 'C', 'D']) await h.manager.getSession(h.camera(serial, 'SHARED'));
+        await flush();
+        await assert.rejects(h.manager.stopStream('A'), error => error.mediaPublic === true && !error.message.includes('secret'));
+        assert.equal(h.manager.sessions.size, 3);
+        assert.equal(h.manager.sourceCount(), 4, 'failed cleanup must not make a still-owned transport free');
+        await assert.rejects(h.manager.getSession(h.camera('E', 'SHARED')), /4|active|limit/i);
+        rejectClose = false;
+        await h.manager.stopStream('A');
+        assert.equal(h.adapters.find(adapter => adapter.serial === 'A').closes, 2);
+        assert.equal(h.manager.sourceCount(), 3);
+        await h.manager.getSession(h.camera('E', 'SHARED')); await flush();
+        assert.equal(h.manager.sourceCount(), 4);
+    } finally { rejectClose = false; }
+});
+
+test('reset and disposal retry failed private termination and await its successful cleanup', async t => {
+    for (const action of ['reset', 'dispose']) await t.test(action, async subtest => {
+        const finish = deferred();
+        let attempts = 0;
+        const h = harness(subtest, { isolated: true, closeAdapter: () => {
+            if (++attempts === 1) throw Error('worker termination failed');
+            return finish.promise;
+        } });
+        await h.manager.getSession(h.camera('A')); await flush();
+        await assert.rejects(h.manager.stopStream('A'));
+        let done = false;
+        const shutdown = h.manager[action]().then(() => { done = true; });
+        await flush();
+        assert.equal(done, false); assert.equal(attempts, 2);
+        assert.equal(h.manager.sourceCount(), 1);
+        finish.resolve(); await shutdown;
+        assert.equal(h.manager.sourceCount(), 0);
+    });
+});
+
+test('global media cannot claim a private session while binary preparation has no adapter owner yet', async t => {
+    const binary = deferred();
+    const h = harness(t, { isolated: true, resolveBinary: () => binary.promise });
+    const camera = h.camera('A');
+    const session = await h.manager.getSession(camera);
+    const video = new PassThrough(), audio = new PassThrough();
+    await h.manager.streamHandler(video, audio, camera.EufyDevice, camera.EufyStation, { videoCodec: VideoCodec.H264 });
+    assert.equal(video.destroyed, true); assert.equal(audio.destroyed, true);
+    assert.equal(session.input, undefined);
+    assert.equal(h.processes.length, 0);
+    await h.manager.stopStream('A');
+    binary.resolve('/virtual/ffmpeg'); await flush();
+    assert.equal(h.adapters.length, 0, 'cancellation before preparation must not construct a transport');
+});
+
+test('a memory warning stops the newest isolated source by insertion order without changing legacy, native or controls', async t => {
+    const h = harness(t, { isolated: ['HOMEY_OLDER', 'HOMEY_NEWER'] });
+    const older = h.camera('OLDER', 'SHARED'), newer = h.camera('NEWER', 'SHARED');
+    const legacy = h.camera('LEGACY', 'SHARED');
+    const native = h.camera('NATIVE', 'SHARED', { native: true, values: { rtspStreamUrl: 'rtsp://fixture-camera/live' } });
+    const original = { startRTSPStream() {}, controls: 0, setGuardMode() { this.controls++; } };
+    older.EufyStation = original; newer.EufyStation = original; legacy.EufyStation = original;
+    const first = await h.manager.getSession(older), second = await h.manager.getSession(newer);
+    const legacySession = await h.manager.getSession(legacy), nativeSession = await h.manager.getSession(native);
+    // Wall-clock order is deliberately misleading. The last two inserted
+    // sources are also non-private and must never be chosen instead.
+    first.startedAt = 9000; second.startedAt = 1;
+    const firstMedia = await h.deliver(older), secondMedia = await h.deliver(newer), legacyMedia = await h.deliver(legacy);
+    nativeSession.process.stdout.emit('data', transportPackets()); await nativeSession.ready.promise;
+    const owners = [...h.manager.stationOwners];
+    h.homey.emit('memwarn', { count: 1, limit: 3 }); await flush();
+    assert.equal(second.stopped, true);
+    assert.equal(h.manager.sessions.has('NEWER'), false);
+    assert.equal(h.adapters.find(adapter => adapter.serial === 'NEWER').closes, 1);
+    assert.equal(secondMedia.video.destroyed, true); assert.ok(secondMedia.proc.kills.length);
+    assert.equal(h.manager.sessions.get('OLDER'), first); assert.equal(firstMedia.proc.kills.length, 0);
+    assert.equal(h.manager.sessions.get('LEGACY'), legacySession); assert.equal(legacyMedia.proc.kills.length, 0);
+    assert.equal(h.manager.sessions.get('NATIVE'), nativeSession); assert.equal(nativeSession.process.kills.length, 0);
+    assert.deepEqual([...h.manager.stationOwners], owners);
+    assert.equal(h.calls.some(([name]) => name === 'stop'), false);
+    assert.equal(h.manager.getStatus('NEWER').error.replace(/’/g, "'"),
+        "Live video was stopped to stay within Homey's memory limit. Try fewer cameras.");
+    original.setGuardMode(); assert.equal(original.controls, 1);
+    assert.equal(older.EufyStation, original); assert.equal(newer.EufyStation, original);
+    firstMedia.proc.stdout.emit('data', transportPackets());
+    assert.equal(first.bytes, 376, 'the older private feed still delivers video after shedding the newest');
+});
+
+test('repeated memory warnings shed one private source each and closing workers retain all four capacity slots', async t => {
+    const closed = { C: deferred(), D: deferred() };
+    const h = harness(t, { isolated: true, closeAdapter: adapter => closed[adapter.serial]?.promise });
+    try {
+        for (const serial of ['A', 'B', 'C', 'D']) {
+            const camera = h.camera(serial, 'SHARED');
+            await h.manager.getSession(camera); await h.deliver(camera);
+        }
+        h.homey.emit('memwarn', { count: 1, limit: 3 });
+        assert.deepEqual([...h.manager.sessions.keys()], ['A', 'B', 'C']);
+        h.homey.emit('memwarn', { count: 2, limit: 3 }); await flush();
+        assert.deepEqual([...h.manager.sessions.keys()], ['A', 'B']);
+        assert.deepEqual(h.calls.filter(([name]) => name === 'private-close').map(([, serial]) => serial), ['D', 'C']);
+        assert.equal(h.manager.sourceCount(), 4, 'warning cleanup cannot release an unconfirmed worker');
+        await assert.rejects(h.manager.getSession(h.camera('E', 'SHARED')), /4|active|limit/i);
+        assert.equal(h.adapters.length, 4);
+        closed.C.resolve(); closed.D.resolve();
+        await Promise.all([...h.manager.stopping.values()]); await flush();
+        assert.equal(h.manager.sourceCount(), 2);
+        assert.equal(h.calls.filter(([name]) => name === 'private-start').length, 4, 'warning recovery never restarts a stopped source');
+        h.homey.emit('memwarn', { count: 3, limit: 3 }); await flush();
+        assert.deepEqual([...h.manager.sessions.keys()], ['A']);
+        h.homey.emit('memwarn', { count: 4, limit: 3 }); await flush();
+        assert.equal(h.manager.sessions.size, 0);
+        h.homey.emit('memwarn', { count: 5, limit: 3 }); await flush();
+        assert.equal(h.adapters.length, 4);
+        assert.equal(h.adapters.every(adapter => adapter.closes === 1), true);
+    } finally { closed.C.resolve(); closed.D.resolve(); }
+});
+
+test('memory warnings without private sources leave existing legacy and native media untouched', async t => {
+    const h = harness(t);
+    const legacy = h.camera('LEGACY', 'SHARED');
+    const native = h.camera('NATIVE', 'SHARED', { native: true, values: { rtspStreamUrl: 'rtsp://fixture-camera/live' } });
+    const first = await h.manager.getSession(legacy), second = await h.manager.getSession(native);
+    const media = await h.deliver(legacy);
+    second.process.stdout.emit('data', transportPackets()); await second.ready.promise;
+    const before = h.calls.slice();
+    for (let count = 1; count <= 3; count++) h.homey.emit('memwarn', { count, limit: 3 });
+    await flush();
+    assert.equal(h.manager.sessions.get('LEGACY'), first); assert.equal(h.manager.sessions.get('NATIVE'), second);
+    assert.equal(media.proc.kills.length, 0); assert.equal(second.process.kills.length, 0);
+    assert.deepEqual(h.calls, before); assert.equal(h.adapters.length, 0);
+});
+
+test('a warning during pending private preparation cancels only the newest request and cannot create its worker later', async t => {
+    const binary = deferred();
+    const h = harness(t, { isolated: true, resolveBinary: () => binary.promise });
+    const firstCamera = h.camera('FIRST', 'SHARED'), newestCamera = h.camera('NEWEST', 'SHARED');
+    const first = await h.manager.getSession(firstCamera), newest = await h.manager.getSession(newestCamera);
+    const rejected = assert.rejects(newest.ready.promise, /memory limit.*fewer cameras/i);
+    h.homey.emit('memwarn', { count: 1, limit: 3 });
+    await rejected;
+    binary.resolve('/virtual/ffmpeg'); await flush();
+    assert.equal(h.manager.sessions.get('FIRST'), first);
+    assert.equal(h.manager.sessions.has('NEWEST'), false);
+    assert.deepEqual(h.adapters.map(adapter => adapter.serial), ['FIRST']);
+    await h.deliver(firstCamera); await first.ready.promise;
+    assert.equal(h.manager.getStatus('FIRST').state, 'streaming');
+});
+
+test('disposal removes only the manager memory listener and later warnings cannot operate retired media', async t => {
+    const h = harness(t, { isolated: true });
+    const warnings = [];
+    const external = warning => warnings.push(warning);
+    h.homey.on('memwarn', external);
+    assert.equal(h.homey.listenerCount('memwarn'), 2);
+    await h.manager.getSession(h.camera()); await flush();
+    await h.manager.dispose();
+    assert.deepEqual(h.homey.listeners('memwarn'), [external]);
+    const before = h.calls.slice();
+    const warning = { count: 1, limit: 3 };
+    h.homey.emit('memwarn', warning); await flush();
+    assert.deepEqual(warnings, [warning]); assert.deepEqual(h.calls, before);
+});
+
+test('memory pressure blocks immediate new private workers but shares current sources and permits an explicit retry after cooldown', async t => {
+    let now = 1000;
+    const h = harness(t, { isolated: ['HOMEY_A', 'HOMEY_B', 'HOMEY_C'], now: () => now,
+        managerOptions: { memoryRetryMs: 20 } });
+    const a = h.camera('A', 'SHARED'), b = h.camera('B', 'SHARED'), legacy = h.camera('LEGACY', 'SHARED');
+    const first = await h.manager.getSession(a), newest = await h.manager.getSession(b), normal = await h.manager.getSession(legacy);
+    await h.deliver(a); await h.deliver(b); await h.deliver(legacy);
+    h.homey.emit('memwarn', { count: 1, limit: 3 }); await flush();
+    assert.equal(newest.stopped, true);
+    const memoryError = /Live video was stopped to stay within Homey['’]s memory limit\. Try fewer cameras\./;
+    await assert.rejects(h.manager.getSession(b), memoryError);
+    await assert.rejects(h.manager.getSession(h.camera('C', 'SHARED')), memoryError);
+    assert.equal(h.adapters.length, 2, 'requests inside the cooldown cannot allocate replacement workers');
+    assert.equal(await h.manager.getSession(a), first, 'an existing private source requires no additional worker');
+    assert.equal(await h.manager.getSession(legacy), normal, 'normal Station sharing stays available');
+    const native = h.camera('NATIVE', 'SHARED', { native: true, values: { rtspStreamUrl: 'rtsp://fixture-camera/live' } });
+    const nativeSession = await h.manager.getSession(native); await flush();
+    assert.equal(nativeSession.native, true); assert.equal(h.adapters.length, 2);
+    now += 21; await flush();
+    assert.equal(h.adapters.length, 2, 'the cooldown ending cannot itself start a camera');
+    const retried = await h.manager.getSession(b); await flush();
+    assert.notEqual(retried, newest);
+    assert.equal(h.adapters.length, 3);
+    assert.deepEqual(h.calls.filter(([name]) => name === 'private-start').map(([, serial]) => serial), ['A', 'B', 'B']);
+    await h.deliver(b); await retried.ready.promise;
+    assert.equal(h.manager.getStatus('B').state, 'streaming');
+});
+
+test('a completed reset clears the private memory cooldown without needing the clock to advance', async t => {
+    const h = harness(t, { isolated: true, now: () => 1000, managerOptions: { memoryRetryMs: 20 } });
+    const camera = h.camera('A');
+    await h.manager.getSession(camera); await h.deliver(camera);
+    h.homey.emit('memwarn', { count: 1, limit: 3 }); await flush();
+    await assert.rejects(h.manager.getSession(camera), /memory limit/i);
+    await h.manager.reset();
+    const restarted = await h.manager.getSession(camera); await flush();
+    assert.equal(h.adapters.length, 2);
+    await h.deliver(camera); await restarted.ready.promise;
+    assert.equal(h.manager.getStatus('A').state, 'streaming');
 });
 
 test('H264 P2P video keeps its copy path without encoder or resizing work', async (t) => {
@@ -791,8 +1244,9 @@ test('reset and disposal during binary preparation prevent stale P2P dispatch', 
             assert.equal(h.manager.stationOwners.size, 0);
             if (action === 'dispose') await assert.rejects(h.manager.getSession(h.camera()), /shut|stop|closed|disposed/i);
             else {
-                const retry = await h.manager.getSession(h.camera());
-                await h.deliver(h.camera());
+                const retryCamera = h.camera();
+                const retry = await h.manager.getSession(retryCamera);
+                await h.deliver(retryCamera);
                 await retry.ready.promise;
             }
         });

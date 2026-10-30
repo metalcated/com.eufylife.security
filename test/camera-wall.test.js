@@ -36,7 +36,12 @@ function harness(t, options = {}) {
             unset(key) { calls.push(['clear', key]); settings.delete(key); }
         },
         app: { deviceList: [], appSettings: { retained: true }, FfmpegManager: {
-            videos: new Map(), sessions: new Map(), stationOwners: new Map(), maxSessions: 4,
+            videos: new Map(), sessions: new Map(), stationOwners: new Map(), stopping: new Map(), maxSessions: 4,
+            sourceCount() { return new Set([...this.sessions.keys(), ...this.stopping.keys()]).size; },
+            isolatedP2P(device) {
+                const enabled = settings.get('camera_isolated_p2p_devices');
+                return enabled === true || (Array.isArray(enabled) && enabled.includes(device.getId()));
+            },
             supports: device => device?.camera === true,
             nativeEnabled: device => device.native === true,
             assertCamera(device) { if (!device.ready || device.privacy) throw Error(SECRET); }
@@ -240,6 +245,50 @@ test('full P2P source capacity is refused before negotiation but an existing own
     const view = await h.manager.offer('DEVICE_1', OFFER);
     assert.match(view.handle, /^[0-9a-f]{48}$/);
     assert.equal(media.sessions.size, 2, 'the wall must not reserve or release source sessions');
+});
+
+test('selected isolated cameras may negotiate on a busy HomeBase without changing its legacy owner', async t => {
+    const h = harness(t);
+    const selected = h.camera();
+    const media = h.homey.app.FfmpegManager;
+    const station = selected.EufyDevice.getStationSerial();
+    media.stationOwners.set(station, SECRET);
+    media.sessions.set(SECRET, { legacy: true });
+    h.settings.set('camera_isolated_p2p_devices', [selected.getId()]);
+    const view = await h.manager.offer(selected.getId(), OFFER);
+    assert.match(view.handle, /^[a-f0-9]{48}$/);
+    assert.equal(h.calls.filter(([name]) => name === 'offer').length, 1);
+    assert.equal(media.stationOwners.get(station), SECRET);
+    assert.deepEqual([...media.sessions], [[SECRET, { legacy: true }]], 'the wall does not start or replace manager sources');
+});
+
+test('isolated wall eligibility still counts closing sources and shares an existing own session', async t => {
+    const h = harness(t);
+    const camera = h.camera();
+    const media = h.homey.app.FfmpegManager;
+    h.settings.set('camera_isolated_p2p_devices', true);
+    for (const serial of ['A', 'B', 'C']) media.sessions.set(serial, {});
+    media.stopping.set('D', Promise.resolve());
+    await assert.rejects(h.manager.offer(camera.getId(), OFFER), /stream limit/i);
+    assert.equal(h.calls.filter(([name]) => name === 'offer').length, 0);
+    media.sessions.set(camera.EufyDevice.getSerial(), { shared: true });
+    const view = await h.manager.offer(camera.getId(), OFFER);
+    assert.match(view.handle, /^[a-f0-9]{48}$/);
+    assert.equal(media.stopping.has('D'), true);
+});
+
+test('the wall rechecks isolated capacity after asynchronous API preparation', async t => {
+    const pending = deferred();
+    const h = harness(t, { createLocalAPI: () => pending.promise });
+    const camera = h.camera();
+    h.settings.set('camera_isolated_p2p_devices', [camera.getId()]);
+    const offer = h.manager.offer(camera.getId(), OFFER);
+    const media = h.homey.app.FfmpegManager;
+    for (const serial of ['A', 'B', 'C', 'D']) media.stopping.set(serial, Promise.resolve());
+    pending.resolve(h.api);
+    await assert.rejects(offer, /stream limit/i);
+    assert.equal(h.calls.filter(([name]) => name === 'offer').length, 0);
+    assert.equal(h.manager.handles.size, 0);
 });
 
 test('working native RTSP bypasses P2P station ownership and source capacity', async t => {

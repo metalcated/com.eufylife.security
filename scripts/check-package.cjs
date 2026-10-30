@@ -32,6 +32,7 @@ async function main() {
             for (const required of ['app.json', 'app.js', 'drivers/main-lock.js', 'drivers/main-display.js',
                 'lib/lock-support.js', 'lib/display-support.js', 'lib/display-discovery.js', 'assets/icon.svg',
                 'api.js', 'lib/helpers/camera-media.helper.js', 'lib/helpers/camera-wall.helper.js',
+                'lib/helpers/camera-p2p-session.helper.js', 'lib/helpers/camera-p2p-worker.js',
                 'settings/index.html', 'settings/camera-wall.js', 'settings/camera-wall.css',
                 'node_modules/eufy-security-client/build/index.js', 'node_modules/homey-api/index.js']) {
                 assert(files.includes(required), `Missing runtime file: ${required}`);

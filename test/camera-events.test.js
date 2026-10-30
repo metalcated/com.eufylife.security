@@ -39,6 +39,7 @@ function harness() {
     };
     const manager = {
         streamHandler: async (...args) => calls.push(['start', ...args]),
+        sourceStopped: async (...args) => calls.push(['source-stop', ...args]),
         stopStream: async (...args) => calls.push(['stop', ...args])
     };
     const homey = { app: {
@@ -113,9 +114,10 @@ test('an asynchronous stream failure is handled without an unhandled event promi
     assert.doesNotThrow(() => h.client.emit('station livestream start', {}, h.remote, {}, {}, {}));
     await flush();
     assert.deepEqual(h.errors, [failure]);
-    h.client.emit('station livestream stop', {}, h.remote);
+    const station = {};
+    h.client.emit('station livestream stop', station, h.remote);
     await flush();
-    assert.deepEqual(h.calls, [['stop', h.remote]], 'a failed source does not break later cleanup events');
+    assert.deepEqual(h.calls, [['source-stop', station, h.remote]], 'a failed source does not break later cleanup events');
 });
 
 test('privacy-off and source-stop target their own device while client close stops all media', async () => {
@@ -126,12 +128,13 @@ test('privacy-off and source-stop target their own device while client close sto
     await flush();
     assert.equal(h.calls.some(([name]) => name === 'stop'), false);
     h.client.emit('device property changed', h.remote, PropertyName.DeviceEnabled, false);
-    h.client.emit('station livestream stop', {}, h.remote);
+    const station = {};
+    h.client.emit('station livestream stop', station, h.remote);
     h.client.emit('close');
     await flush();
-    assert.deepEqual(h.calls.filter(([name]) => name === 'stop'), [
+    assert.deepEqual(h.calls.filter(([name]) => name === 'stop' || name === 'source-stop'), [
         ['stop', h.remote],
-        ['stop', h.remote],
+        ['source-stop', station, h.remote],
         ['stop']
     ]);
     assert.ok(h.calls.some(([name, device, remote, property, value]) =>
@@ -142,6 +145,7 @@ test('media stop rejections from privacy, source stop and client close are all c
     const h = harness();
     const failure = new Error('Fixture stop failure');
     h.manager.stopStream = async () => { throw failure; };
+    h.manager.sourceStopped = async () => { throw failure; };
     h.client.emit('device property changed', h.remote, PropertyName.DeviceEnabled, false);
     h.client.emit('station livestream stop', {}, h.remote);
     h.client.emit('close');

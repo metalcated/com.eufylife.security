@@ -1,4 +1,7 @@
 {
+  "3.44.5": {
+    "en": "Add opt-in isolated camera connections for concurrent HomeBase video, with bounded per-camera startup, buffering, and cleanup. Existing controls and native RTSP remain on their current paths."
+  },
   "3.44.4": {
     "en": "Stop showing a general migration advisory as a camera fault while preserving device-specific warnings and account notifications."
   },

@@ -88,7 +88,8 @@ async function cleanup() {
 async function main() {
     const starts = new Map();
     const updates = [];
-    const homey = { platformVersion: 2, app: { log() {}, error() {}, warn() {}, debug() {} },
+    const homey = { platformVersion: 2, settings: { get: key => key === 'camera_isolated_p2p_devices' ? true : undefined },
+        app: { log() {}, error() {}, warn() {}, debug() {} },
         videos: { async createVideoOther(options) {
             assert.equal(options.demuxer, 'mpegts');
             return { registerVideoUrlListener(listener) { this.listener = listener; }, async unregister() {} };
@@ -102,8 +103,9 @@ async function main() {
     let managerBinaryReady = false;
     const cameras = new Map();
     const client = new EventEmitter();
-    client.setCameraMaxLivestreamDuration = (seconds) => assert.equal(seconds, 300);
-    client.startStationLivestream = async (serial) => {
+    client.startStationLivestream = async () => { throw Error('The isolated fixture must not start the shared Station'); };
+    client.stopStationLivestream = async () => { throw Error('The isolated fixture must not stop the shared Station'); };
+    const startSource = async (serial, onStream) => {
         assert.equal(managerBinaryReady, true, 'P2P dispatch occurred before the media binary was ready');
         starts.set(serial, (starts.get(serial) || 0) + 1);
         assert.equal(starts.get(serial), 1, `duplicate synthetic upstream for ${serial}`);
@@ -120,17 +122,21 @@ async function main() {
             '-threads', '1', '-t', '16', '-f', h265 ? 'hevc' : 'h264', 'pipe:1'], `generator ${serial}`);
         const audio = new PassThrough();
         generators.set(serial, { generator, audio });
-        await manager.streamHandler(generator.stdout, audio, camera.EufyDevice, camera.EufyStation,
-            { videoCodec: camera.sourceCodec, videoFPS: frameRate });
+        await onStream(generator.stdout, audio, { videoCodec: camera.sourceCodec, videoFPS: frameRate });
     };
-    client.stopStationLivestream = async (serial) => {
+    const stopSource = async (serial) => {
         const source = generators.get(serial);
         if (source) { source.generator.kill('SIGTERM'); source.audio.destroy(); generators.delete(serial); }
     };
     homey.app.eufyClient = client;
     manager = new CameraMediaManager(homey, {
+        preferSharedP2P: false, // Exercise all synthetic private sources in the codec fixture.
         userdata: workspace, startTimeoutMs: 8000, snapshotTimeoutMs: 8000,
         idleTimeoutMs: 12000, maxDurationMs: 18000,
+        createP2PSession: ({ homeyDevice, onStream }) => {
+            const serial = homeyDevice.EufyDevice.getSerial();
+            return { start: () => startSource(serial, onStream), close: () => stopSource(serial) };
+        },
         resolveBinary: async () => { managerBinaryReady = true; return binary; },
         spawn: (command, args) => trackProcess(command, args, args.includes('image2pipe') ? 'snapshot decoder' : 'MPEG-TS muxer')
     });
@@ -160,8 +166,8 @@ async function main() {
     }
 
     const first = camera('GENERATED_A', 'FIXTURE_STATION_A');
-    const independent = camera('GENERATED_B', 'FIXTURE_STATION_B');
-    const converted = camera('GENERATED_HEVC', 'FIXTURE_STATION_HEVC', VideoCodec.H265);
+    const independent = camera('GENERATED_B', 'FIXTURE_STATION_A');
+    const converted = camera('GENERATED_HEVC', 'FIXTURE_STATION_A', VideoCodec.H265);
     await manager.registerVideo(first);
     await manager.registerVideo(independent);
     await manager.registerVideo(converted);
@@ -187,8 +193,8 @@ async function main() {
     assert.ok(manager.getStatus('GENERATED_B').bytes > 188);
     assert.ok(manager.getStatus('GENERATED_HEVC').bytes > 188);
     await manager.stopStream('GENERATED_A');
-    assert.equal(manager.getStatus('GENERATED_B').state, 'streaming', 'stopping one station interrupted the other');
-    console.log(`Generated-media check passed: four real HTTP MPEG-TS viewers required H264 decoding (${results.slice(0, 4).map(frame => `${frame.width}x${frame.height}/${frame.bytes} bytes`).join(', ')}); 1920x1080 HEVC was converted within 720p, three cameras used one upstream each, and coalesced snapshots published fresh H264/HEVC-source images.`);
+    assert.equal(manager.getStatus('GENERATED_B').state, 'streaming', 'stopping one camera interrupted its peer on the same synthetic HomeBase');
+    console.log(`Generated-media check passed: four real HTTP MPEG-TS viewers required H264 decoding (${results.slice(0, 4).map(frame => `${frame.width}x${frame.height}/${frame.bytes} bytes`).join(', ')}); 1920x1080 HEVC was converted within 720p, three cameras on one synthetic HomeBase used one upstream each, and coalesced snapshots published fresh H264/HEVC-source images.`);
 }
 
 const deadline = setTimeout(() => {
