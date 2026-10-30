@@ -254,7 +254,7 @@ test('selected cameras on one HomeBase use separate sources and stopping one lea
 });
 
 test('shared-first mode uses one original Station and only an additional worker for concurrent cameras on that HomeBase', async t => {
-    const h = harness(t, { isolated: ['HOMEY_A', 'HOMEY_B'], productionDefaults: true });
+    const h = harness(t, { isolated: ['HOMEY_A', 'HOMEY_B'], managerOptions: { preferSharedP2P: true } });
     const a = h.camera('A', 'SHARED'), b = h.camera('B', 'SHARED');
     const original = { startRTSPStream() {}, controls: 0, setGuardMode() { this.controls++; } };
     a.EufyStation = original; b.EufyStation = original;
@@ -593,19 +593,58 @@ test('a warning during pending private preparation cancels only the newest reque
     assert.equal(h.manager.getStatus('FIRST').state, 'streaming');
 });
 
-test('disposal removes only the manager memory listener and later warnings cannot operate retired media', async t => {
+test('disposal removes only the manager resource listeners and later warnings cannot operate retired media', async t => {
     const h = harness(t, { isolated: true });
     const warnings = [];
     const external = warning => warnings.push(warning);
     h.homey.on('memwarn', external);
+    h.homey.on('cpuwarn', external);
     assert.equal(h.homey.listenerCount('memwarn'), 2);
+    assert.equal(h.homey.listenerCount('cpuwarn'), 2);
     await h.manager.getSession(h.camera()); await flush();
     await h.manager.dispose();
     assert.deepEqual(h.homey.listeners('memwarn'), [external]);
+    assert.deepEqual(h.homey.listeners('cpuwarn'), [external]);
     const before = h.calls.slice();
     const warning = { count: 1, limit: 3 };
     h.homey.emit('memwarn', warning); await flush();
-    assert.deepEqual(warnings, [warning]); assert.deepEqual(h.calls, before);
+    h.homey.emit('cpuwarn', warning); await flush();
+    assert.deepEqual(warnings, [warning, warning]); assert.deepEqual(h.calls, before);
+});
+
+test('selected cameras use owned video from the first source while unselected controls and media keep their account Station', async t => {
+    const h = harness(t, { isolated: ['HOMEY_A', 'HOMEY_B'], productionDefaults: true });
+    const a = h.camera('A', 'SHARED'), b = h.camera('B', 'SHARED'), legacy = h.camera('LEGACY', 'SHARED');
+    const first = await h.manager.getSession(a), second = await h.manager.getSession(b), normal = await h.manager.getSession(legacy);
+    await h.deliver(a); await h.deliver(b); await h.deliver(legacy);
+    assert.equal(first.isolated, true); assert.equal(second.isolated, true); assert.equal(normal.isolated, false);
+    assert.deepEqual(h.adapters.map(adapter => adapter.serial), ['A', 'B']);
+    assert.deepEqual(h.calls.filter(([name]) => name === 'start').map(([, serial]) => serial), ['LEGACY']);
+    await h.manager.stopStream('A');
+    assert.equal(h.manager.sessions.get('B'), second); assert.equal(h.manager.sessions.get('LEGACY'), normal);
+    assert.equal(h.calls.some(([name, serial]) => name === 'stop' && serial === 'LEGACY'), false);
+});
+
+test('sustained CPU warnings shed only the newest private video and preserve legacy and native streams during cooldown', async t => {
+    const h = harness(t, { isolated: ['HOMEY_A', 'HOMEY_B'], now: () => 1000 });
+    const a = h.camera('A', 'SHARED'), b = h.camera('B', 'SHARED'), legacy = h.camera('LEGACY', 'SHARED');
+    const native = h.camera('NATIVE', 'SHARED', { native: true, values: { rtspStreamUrl: 'rtsp://fixture-camera/live' } });
+    const first = await h.manager.getSession(a), second = await h.manager.getSession(b), normal = await h.manager.getSession(legacy);
+    const nativeSession = await h.manager.getSession(native);
+    const firstMedia = await h.deliver(a); await h.deliver(b); const normalMedia = await h.deliver(legacy);
+    nativeSession.process.stdout.emit('data', transportPackets()); await nativeSession.ready.promise;
+    for (const count of [1, 2]) h.homey.emit('cpuwarn', { count, limit: 12 });
+    await flush(); assert.equal(second.stopped, false); assert.equal(h.adapters.every(adapter => adapter.closes === 0), true);
+    h.homey.emit('cpuwarn', { count: 3, limit: 12 }); await flush();
+    assert.equal(second.stopped, true); assert.equal(h.manager.sessions.get('A'), first);
+    assert.match(h.manager.getStatus('B').error, /CPU limit/);
+    await assert.rejects(h.manager.getSession(b), /CPU limit/);
+    assert.equal(h.manager.sessions.get('LEGACY'), normal); assert.equal(h.manager.sessions.get('NATIVE'), nativeSession);
+    assert.equal(normalMedia.proc.kills.length, 0); assert.equal(nativeSession.process.kills.length, 0);
+    firstMedia.proc.stdout.emit('data', transportPackets()); assert.equal(first.bytes, 376);
+    h.homey.emit('cpuwarn', { count: 4, limit: 12 }); await flush();
+    assert.equal(first.stopped, true); assert.equal(normalMedia.proc.kills.length, 0); assert.equal(nativeSession.process.kills.length, 0);
+    assert.equal(h.calls.some(([name]) => name === 'stop'), false);
 });
 
 test('memory pressure blocks immediate new private workers but shares current sources and permits an explicit retry after cooldown', async t => {

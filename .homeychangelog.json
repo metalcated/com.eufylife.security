@@ -1,4 +1,10 @@
 {
+  "3.44.7": {
+    "en": "Use native crypto for private camera video keys when supported, reduce concurrent video CPU overhead, and shed private video after sustained CPU warnings while preserving controls."
+  },
+  "3.44.6": {
+    "en": "Reduce concurrent camera memory use by sharing the loaded Eufy library while keeping each additional camera's Station connection separate. Bound cancellation, socket cleanup and retries without changing account controls or native RTSP."
+  },
   "3.44.5": {
     "en": "Add opt-in isolated camera connections for concurrent HomeBase video, with bounded per-camera startup, buffering, and cleanup. Existing controls and native RTSP remain on their current paths."
   },
