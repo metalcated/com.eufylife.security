@@ -12,7 +12,7 @@ const net = require('node:net');
 
 const OWNER = 'com.eufylife.security';
 const SDK = '4.2.6';
-const VERSION = '0.2.0';
+const VERSION = '0.2.3';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const IDENTITY = /^[A-Za-z0-9_-]{1,128}$/;
 const BODY_LIMIT = 512 * 1024;
@@ -27,10 +27,28 @@ const DIAGNOSTICS = Object.freeze({
     'source.closed': 'Camera source resources were closed.',
     'source.close_failed': 'Camera source cleanup is unconfirmed; its capacity remains reserved.',
     'p2p.starting': 'An independent P2P connection is starting.',
+    'p2p.device_create': 'The independent camera is being prepared.',
+    'p2p.device_init': 'The independent camera is being initialized.',
+    'p2p.station_create': 'The independent camera station is being prepared.',
+    'p2p.station_init': 'The independent camera station is being initialized.',
+    'p2p.connecting': 'The independent camera is connecting to its station.',
+    'p2p.start_video': 'The independent camera is requesting video.',
+    'p2p.receiving_video': 'The independent camera produced its first video bytes.',
+    'p2p.codec_h264_to_hevc': 'The T8423 video input was identified as HEVC instead of declared H.264.',
+    'p2p.codec_hevc_to_h264': 'The T8423 video input was identified as H.264 instead of declared HEVC.',
     'p2p.failed': 'An independent P2P connection failed.',
     'p2p.ended': 'An independent P2P connection ended.',
     'media.failed': 'A camera media process failed.',
     'media.ended': 'A camera media process ended.',
+    'media.input_bytes': 'The camera media process received its first video input bytes.',
+    'media.input_0': 'The startup deadline expired with no parent video input bytes.',
+    'media.input_under_32kib': 'The startup deadline expired with less than 32 KiB of parent video input.',
+    'media.input_under_256kib': 'The startup deadline expired with at least 32 KiB and less than 256 KiB of parent video input.',
+    'media.input_at_least_256kib': 'The startup deadline expired with at least 256 KiB of parent video input.',
+    'media.started': 'The camera media process was requested.',
+    'media.codec_missing_parameter_sets': 'The camera media input is missing required codec parameter sets.',
+    'media.invalid_bitstream': 'The camera media input could not be decoded as the selected video format.',
+    'media.no_streams': 'The camera media process could not find a usable video stream.',
     'lease.cancelled': 'A camera lease was cancelled by its owner.',
     'lease.replaced': 'A camera lease was revoked by a newer app connection.',
     'lease.expired': 'A camera lease expired without renewal.',
@@ -45,6 +63,20 @@ const DIAGNOSTICS = Object.freeze({
     'helper.stopping': 'The camera helper is stopping and closing its sources.',
     'diagnostics.suppressed': 'Further helper diagnostics are suppressed until the next minute.',
 });
+const P2P_PHASE_EVENTS = Object.freeze({
+    'device-create': 'p2p.device_create',
+    'device-init': 'p2p.device_init',
+    'station-create': 'p2p.station_create',
+    'station-init': 'p2p.station_init',
+    connect: 'p2p.connecting',
+    start: 'p2p.start_video',
+    stream: 'p2p.receiving_video',
+});
+const MEDIA_STDERR_CATEGORIES = Object.freeze([
+    ['media.codec_missing_parameter_sets', /(?:non-existing\s+(?:PPS|SPS|VPS)|(?:PPS|SPS|VPS)[^\r\n]{0,100}(?:unavailable|missing|out of range|does not exist)|missing\s+(?:PPS|SPS|VPS))/i],
+    ['media.invalid_bitstream', /(?:invalid (?:NAL unit|data found|bitstream)|error (?:while )?decoding|could not find codec parameters)/i],
+    ['media.no_streams', /(?:does not contain any stream|stream map[^\r\n]{0,256}matches no streams|no (?:video )?streams? found|could not find (?:any )?streams)/i],
+]);
 const START_TIMEOUT_MESSAGES = new Set([
     'The camera did not deliver independent video in time.',
     'The camera did not deliver video in time. Check its connection and retry.',
@@ -148,10 +180,25 @@ class HelperServer {
             createP2PSession: params => {
                 const record = params.homeyDevice.helperRecord;
                 record.sourceFailureReported = false;
+                record.p2pPhase = null;
+                const input = record.mediaInput = { bytes: 0 };
                 this.diagnostic('p2p.starting');
                 const configured = { ...params, client: params.homeyDevice.rpcClient,
+                    onCodecCorrection: (...args) => {
+                        if (args.length !== 2 || ![0, 1].includes(args[0]) || ![0, 1].includes(args[1]) || args[0] === args[1]
+                            || !this.current(record) || record.sourceFailureReported || record.codecCorrectionReported) return;
+                        record.codecCorrectionReported = true;
+                        this.diagnostic(args[0] === 0 ? 'p2p.codec_h264_to_hevc' : 'p2p.codec_hevc_to_h264');
+                    },
+                    onPhase: phase => {
+                        if (!this.current(record) || record.sourceFailureReported || typeof phase !== 'string'
+                            || !Object.hasOwn(P2P_PHASE_EVENTS, phase) || record.p2pPhase === phase) return;
+                        record.p2pPhase = phase;
+                        this.diagnostic(P2P_PHASE_EVENTS[phase]);
+                    },
                     onStream: (...args) => this.context.run(record, () => {
                         this.observeSource(record, this.manager.sessions?.get(record.serial));
+                        this.observeMediaInput(record, args[0], input);
                         return params.onStream(...args);
                     }),
                     onStop: (...args) => this.context.run(record, () => {
@@ -169,6 +216,10 @@ class HelperServer {
                 const proc = (options.spawn || spawn)(...args), record = this.context.getStore();
                 if (record) {
                     record.processes.add(proc); proc.once('close', () => record.processes.delete(proc));
+                    if (this.current(record) && !record.mediaStartedReported && Array.isArray(args[1]) && args[1].includes('-mpegts_flags')) {
+                        record.mediaStartedReported = true; this.diagnostic('media.started');
+                    }
+                    this.observeMediaStderr(record, proc);
                     proc.once('error', () => { record.processes.delete(proc); if (this.current(record)) this.diagnostic('media.failed'); });
                     proc.once('exit', code => {
                         if (this.current(record) && this.manager.sessions?.get(record.serial)?.process === proc) this.diagnostic(code === 0 ? 'media.ended' : 'media.failed');
@@ -208,6 +259,47 @@ class HelperServer {
         } catch { /* Diagnostics must not interrupt video or resource cleanup. */ }
     }
 
+    observeMediaStderr(record, proc) {
+        if (typeof proc.stderr?.on !== 'function') return;
+        // The fixed-size buffer is scanned only for known error classes. It is
+        // never logged or returned: FFmpeg text can contain private input URLs.
+        const buffer = Buffer.alloc(8192);
+        let length = 0;
+        const inspect = chunk => {
+            if (!this.current(record) || !Buffer.isBuffer(chunk)) { length = 0; return; }
+            for (let offset = 0; offset < chunk.length; offset += 4096) {
+                if (!this.current(record)) { length = 0; return; }
+                const piece = chunk.subarray(offset, offset + 4096);
+                const keep = Math.min(length, buffer.length - piece.length);
+                buffer.copy(buffer, 0, length - keep, length);
+                piece.copy(buffer, keep); length = keep + piece.length;
+                const text = buffer.toString('utf8', 0, length);
+                for (const [category, pattern] of MEDIA_STDERR_CATEGORIES) {
+                    if (record.mediaDiagnostics?.has(category) || !pattern.test(text) || !this.current(record)) continue;
+                    record.mediaDiagnostics ||= new Set(); record.mediaDiagnostics.add(category);
+                    this.diagnostic(category);
+                }
+            }
+        };
+        proc.stderr.on('data', inspect);
+        proc.once('close', () => { proc.stderr.removeListener('data', inspect); buffer.fill(0); length = 0; });
+    }
+
+    observeMediaInput(record, video, input) {
+        if (typeof video?.on !== 'function') return;
+        const inspect = chunk => {
+            if (!this.current(record) || record.sourceFailureReported || record.mediaInput !== input
+                || !Buffer.isBuffer(chunk) || !chunk.length) return;
+            input.bytes += Math.min(chunk.length, Number.MAX_SAFE_INTEGER - input.bytes);
+            if (!record.mediaInputReported) {
+                record.mediaInputReported = true;
+                this.diagnostic('media.input_bytes');
+            }
+        };
+        video.on('data', inspect);
+        video.once('close', () => video.removeListener('data', inspect));
+    }
+
     startFailure(error, fallback = 'source.failed') {
         return error?.mediaPublic === true && START_TIMEOUT_MESSAGES.has(error.message) ? 'source.start_timeout' : fallback;
     }
@@ -215,7 +307,13 @@ class HelperServer {
     sourceFailure(record, error, fallback) {
         if (!this.current(record) || record.sourceFailureReported) return;
         record.sourceFailureReported = true;
-        this.diagnostic(this.startFailure(error, fallback));
+        const failure = this.startFailure(error, fallback);
+        if (failure === 'source.start_timeout') {
+            const bytes = record.mediaInput?.bytes || 0;
+            this.diagnostic(bytes === 0 ? 'media.input_0' : bytes < 32768 ? 'media.input_under_32kib'
+                : bytes < 262144 ? 'media.input_under_256kib' : 'media.input_at_least_256kib');
+        }
+        this.diagnostic(failure);
     }
 
     observeSource(record, session) {

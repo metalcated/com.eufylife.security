@@ -1,4 +1,7 @@
 {
+  "3.46.1": {
+    "en": "Improve Floodlight Cam 2 Pro (T8423) live-view compatibility and add bounded camera-helper startup diagnostics."
+  },
   "3.46.0": {
     "en": "Choose a shared camera stream limit or No limit in Camera settings. Saved settings apply across Homey web, iOS and Android and survive app and media-helper restarts."
   },

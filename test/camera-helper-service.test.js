@@ -6,6 +6,8 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
+const { EventEmitter } = require('node:events');
+const { PassThrough } = require('node:stream');
 const nodeTest = require('node:test');
 
 const test = (name, fn) => nodeTest(name, { timeout: 7000 }, fn);
@@ -211,6 +213,245 @@ async function eventReader(t, fixture, id) {
         },
     };
 }
+
+test('P2P progress produces only fixed safe diagnostic events while its lease is current', async t => {
+    const entries = [];
+    let callbacks;
+    const f = await fixture(t, { autoReady: false, serverOptions: {
+        onDiagnostic: entry => entries.push(entry),
+        createP2PSession: params => { callbacks = params; return { async start() {}, async close() {} }; },
+    } });
+    const opened = await f.open();
+    const record = f.helper.records.get(opened.id), manager = f.managers.at(-1);
+    await record.startPromise;
+    manager.options.createP2PSession({ homeyDevice: record.hd, onStream() {}, onStop() {}, onError() {} });
+    assert.equal(record.p2pPhase, null);
+    const phases = ['device-create', 'device-init', 'station-create', 'station-init', 'connect', 'start', 'stream'];
+    const expected = ['p2p.device_create', 'p2p.device_init', 'p2p.station_create', 'p2p.station_init', 'p2p.connecting', 'p2p.start_video', 'p2p.receiving_video'];
+    for (const phase of phases) callbacks.onPhase(phase, { token: SECRET, station: record.serial });
+    assert.equal(record.p2pPhase, 'stream');
+    assert.deepEqual(entries.filter(entry => expected.includes(entry.event)).map(entry => entry.event), expected);
+    assert.ok(entries.every(entry => Object.isFrozen(entry) && Object.keys(entry).sort().join(',') === 'event,message'));
+    const count = entries.length;
+    for (const phase of ['stream', '__proto__', 'connect\nPRIVATE_SECRET', null, 4, [], { phase: 'connect', token: SECRET }]) callbacks.onPhase(phase);
+    assert.equal(entries.length, count); assert.equal(record.p2pPhase, 'stream');
+    assert.doesNotMatch(JSON.stringify(entries), /PRIVATE_SECRET|FIXTURE_|\/v1\/media/);
+    assert.equal(JSON.stringify(entries).includes(SECRET), false);
+
+    manager.sessions.get(record.serial).ready.resolve(); await turn();
+    assert.equal(entries.filter(entry => entry.event === 'source.ready').length, 1);
+    assert.equal(Object.hasOwn((await f.request('GET', `/v1/sessions/${record.id}/status`)).json, 'p2pPhase'), false);
+    assert.equal((await f.request('DELETE', `/v1/sessions/${record.id}`, { owner: OWNER, epoch: f.epoch })).status, 200);
+    const closedCount = entries.length;
+    for (const phase of phases) callbacks.onPhase(phase);
+    assert.equal(entries.length, closedCount, 'closed leases must not emit late progress');
+});
+
+test('startup timeout keeps the last safe P2P phase without duplicating failure diagnostics', async t => {
+    const entries = [];
+    let callbacks;
+    const f = await fixture(t, { autoReady: false, serverOptions: {
+        onDiagnostic: entry => entries.push(entry),
+        createP2PSession: params => { callbacks = params; return { async start() {}, async close() {} }; },
+    } });
+    const opened = await f.open();
+    const record = f.helper.records.get(opened.id), manager = f.managers.at(-1);
+    await record.startPromise;
+    const source = manager.sessions.get(record.serial);
+    manager.options.createP2PSession({ homeyDevice: record.hd, onStream() {}, onStop() {}, onError: error => source.ready.reject(error) });
+    callbacks.onPhase('connect');
+    callbacks.onError(Object.assign(Error('The camera did not deliver independent video in time.'), { mediaPublic: true, metadata: SECRET }));
+    await turn();
+    assert.equal(record.p2pPhase, 'connect');
+    assert.deepEqual(entries.slice(-3).map(entry => entry.event), ['p2p.connecting', 'media.input_0', 'source.start_timeout']);
+    assert.equal(entries.filter(entry => entry.event === 'source.start_timeout').length, 1);
+    const count = entries.length;
+    callbacks.onPhase('start'); callbacks.onCodecCorrection(0, 1); callbacks.onError(Error(SECRET));
+    assert.equal(entries.length, count, 'a failed source must not report later progress or duplicate failures');
+    assert.equal(JSON.stringify(entries).includes(SECRET), false);
+});
+
+test('T8423 codec diagnostics accept only the two enum directions and log once per current lease', async t => {
+    const entries = [], callbacks = [];
+    const f = await fixture(t, { serverOptions: {
+        onDiagnostic: entry => entries.push(entry),
+        createP2PSession: params => { callbacks.push(params); return { async start() {}, async close() {} }; },
+    } });
+    const opened = await f.open();
+    const record = f.helper.records.get(opened.id), manager = f.managers.at(-1);
+    await record.startPromise;
+    const parameters = { homeyDevice: record.hd, onStream() {}, onStop() {}, onError() {} };
+    manager.options.createP2PSession(parameters);
+    const first = callbacks[0];
+    const initialCount = entries.length;
+    for (const args of [[], [0], [true, 1], [0, false], [0, 0], [1, 1], ['0', 1], [0, '1'], [0, 2],
+        [null, 1], [0, { token: SECRET }], [0, 1, SECRET]]) first.onCodecCorrection(...args);
+    assert.equal(entries.length, initialCount, 'unexpected callback arguments must not produce a diagnostic');
+    first.onCodecCorrection(0, 1); first.onCodecCorrection(0, 1);
+    assert.deepEqual(entries.filter(entry => entry.event === 'p2p.codec_h264_to_hevc'), [{
+        event: 'p2p.codec_h264_to_hevc', message: 'The T8423 video input was identified as HEVC instead of declared H.264.',
+    }]);
+    assert.equal(record.codecCorrectionReported, true);
+    manager.options.createP2PSession(parameters);
+    callbacks[1].onCodecCorrection(1, 0);
+    assert.equal(entries.filter(entry => entry.event.startsWith('p2p.codec_')).length, 1, 'another source within the lease must not repeat the marker');
+    assert.doesNotMatch(JSON.stringify(entries), /FIXTURE_|\/v1\/media/);
+    assert.equal(JSON.stringify(entries).includes(SECRET), false);
+
+    assert.equal((await f.request('DELETE', `/v1/sessions/${record.id}`, { owner: OWNER, epoch: f.epoch })).status, 200);
+    const closedCount = entries.length;
+    first.onCodecCorrection(0, 1); callbacks[1].onCodecCorrection(1, 0);
+    assert.equal(entries.length, closedCount);
+
+    const reverse = await f.open('B'), reverseRecord = f.helper.records.get(reverse.id);
+    await reverseRecord.startPromise;
+    manager.options.createP2PSession({ ...parameters, homeyDevice: reverseRecord.hd });
+    callbacks[2].onCodecCorrection(1, 0);
+    assert.deepEqual(entries.filter(entry => entry.event === 'p2p.codec_hevc_to_h264'), [{
+        event: 'p2p.codec_hevc_to_h264', message: 'The T8423 video input was identified as H.264 instead of declared HEVC.',
+    }]);
+    const unused = await f.open('C'), unusedRecord = f.helper.records.get(unused.id);
+    await unusedRecord.startPromise;
+    manager.options.createP2PSession({ ...parameters, homeyDevice: unusedRecord.hd });
+    assert.equal((await f.request('DELETE', `/v1/sessions/${unused.id}`, { owner: OWNER, epoch: f.epoch })).status, 200);
+    const beforeLateFirstCorrection = entries.length;
+    callbacks[3].onCodecCorrection(0, 1);
+    assert.equal(entries.length, beforeLateFirstCorrection, 'a closed lease must also ignore its first correction callback');
+});
+
+test('owned media stderr uses bounded split-safe fixed categories without leaking input text', async t => {
+    const entries = [], processes = [];
+    const f = await fixture(t, { serverOptions: {
+        onDiagnostic: entry => entries.push(entry),
+        spawn: () => { const proc = new EventEmitter(); proc.stderr = new EventEmitter(); proc.exitCode = 0; processes.push(proc); return proc; },
+    } });
+    const opened = await f.open(), record = f.helper.records.get(opened.id), manager = f.managers.at(-1);
+    const create = () => f.helper.context.run(record, () => manager.options.spawn('/synthetic/ffmpeg', ['-mpegts_flags', 'resend_headers', 'pipe:1']));
+    const proc = create();
+    proc.stderr.emit('data', Buffer.from(`rtsp://private-user:${SECRET}@camera/path [h264] non-exis`));
+    proc.stderr.emit('data', Buffer.from('ting PPS 0 referenced\n'));
+    const oversized = Buffer.alloc(1024 * 1024, 120);
+    Buffer.from('Invalid NAL unit').copy(oversized, 4093);
+    Buffer.from('Output file does not contain any stream').copy(oversized, oversized.length - 80);
+    proc.stderr.emit('data', oversized);
+    const categories = ['media.codec_missing_parameter_sets', 'media.invalid_bitstream', 'media.no_streams'];
+    assert.deepEqual(entries.filter(entry => categories.includes(entry.event)).map(entry => entry.event), categories);
+    proc.stderr.emit('data', Buffer.from('SPS unavailable\nInvalid data found\nno video streams found\n'));
+    const other = create(); other.stderr.emit('data', Buffer.from('VPS 0 does not exist\n'));
+    assert.equal(entries.filter(entry => categories.includes(entry.event)).length, 3, 'each category is bounded per lease across processes');
+    assert.equal(entries.filter(entry => entry.event === 'media.started').length, 1);
+    assert.ok(entries.every(entry => Object.keys(entry).sort().join(',') === 'event,message'));
+    assert.doesNotMatch(JSON.stringify(entries), /rtsp:|private-user|FIXTURE_|referenced|Invalid NAL|Output file/);
+    assert.equal(JSON.stringify(entries).includes(SECRET), false);
+    proc.emit('close', 0);
+    assert.equal(proc.stderr.listenerCount('data'), 0);
+    const detached = entries.length;
+    proc.stderr.emit('data', Buffer.from('Invalid bitstream'));
+    assert.equal(entries.length, detached);
+    other.emit('close', 0);
+
+    const unused = await f.open('B'), unusedRecord = f.helper.records.get(unused.id);
+    const late = f.helper.context.run(unusedRecord, () => manager.options.spawn('/synthetic/ffmpeg', []));
+    assert.equal((await f.request('DELETE', `/v1/sessions/${unused.id}`, { owner: OWNER, epoch: f.epoch })).status, 200);
+    const closed = entries.length;
+    late.stderr.emit('data', Buffer.from('non-existing PPS\nInvalid data found\nno video streams found\n'));
+    assert.equal(entries.length, closed, 'closed leases must not classify late stderr');
+    late.emit('close', 0);
+});
+
+test('media input and mux-spawn markers are first-only and ignore snapshots or closed leases', async t => {
+    const entries = [], callbacks = [];
+    const f = await fixture(t, { serverOptions: {
+        onDiagnostic: entry => entries.push(entry),
+        createP2PSession: params => { callbacks.push(params); return { async start() {}, async close() {} }; },
+        spawn: () => { const proc = new EventEmitter(); proc.stderr = new EventEmitter(); proc.exitCode = 0; return proc; },
+    } });
+    const opened = await f.open(), record = f.helper.records.get(opened.id), manager = f.managers.at(-1);
+    const parameters = { homeyDevice: record.hd, onStream(video) { video.resume(); }, onStop() {}, onError() {} };
+    manager.options.createP2PSession(parameters);
+    const video = new PassThrough();
+    callbacks[0].onStream(video, null, {});
+    assert.equal(entries.filter(entry => entry.event === 'media.input_bytes').length, 0);
+    video.write(Buffer.from(SECRET)); video.write(Buffer.from('more synthetic bytes'));
+    assert.equal(entries.filter(entry => entry.event === 'media.input_bytes').length, 1);
+    assert.equal(JSON.stringify(entries).includes(SECRET), false);
+    const snapshot = f.helper.context.run(record, () => manager.options.spawn('/synthetic/ffmpeg', ['-frames:v', '1', '-f', 'image2pipe']));
+    assert.equal(entries.filter(entry => entry.event === 'media.started').length, 0);
+    const mux = f.helper.context.run(record, () => manager.options.spawn('/synthetic/ffmpeg', ['-mpegts_flags', 'resend_headers']));
+    const another = f.helper.context.run(record, () => manager.options.spawn('/synthetic/ffmpeg', ['-mpegts_flags', 'resend_headers']));
+    assert.equal(entries.filter(entry => entry.event === 'media.started').length, 1);
+    snapshot.emit('close', 0); mux.emit('close', 0); another.emit('close', 0); video.destroy();
+
+    const idle = await f.open('B'), idleRecord = f.helper.records.get(idle.id);
+    manager.options.createP2PSession({ ...parameters, homeyDevice: idleRecord.hd });
+    const pending = new PassThrough(); callbacks[1].onStream(pending, null, {});
+    assert.equal((await f.request('DELETE', `/v1/sessions/${idle.id}`, { owner: OWNER, epoch: f.epoch })).status, 200);
+    const beforeLateBytes = entries.length;
+    pending.write(Buffer.from(SECRET)); pending.destroy();
+    assert.equal(entries.length, beforeLateBytes);
+});
+
+test('startup timeouts emit one fixed parent-input bucket at the exact byte boundaries', async t => {
+    const cases = [[0, 'media.input_0'], [1, 'media.input_under_32kib'], [32767, 'media.input_under_32kib'],
+        [32768, 'media.input_under_256kib'], [262143, 'media.input_under_256kib'], [262144, 'media.input_at_least_256kib']];
+    for (const [amount, bucket] of cases) await t.test(String(amount), async subtest => {
+        const entries = [];
+        let callbacks;
+        const f = await fixture(subtest, { autoReady: false, serverOptions: {
+            onDiagnostic: entry => entries.push(entry),
+            createP2PSession: params => { callbacks = params; return { async start() {}, async close() {} }; },
+        } });
+        const opened = await f.open(), record = f.helper.records.get(opened.id), manager = f.managers.at(-1);
+        await record.startPromise;
+        const source = manager.sessions.get(record.serial), video = new PassThrough();
+        subtest.after(() => video.destroy());
+        manager.options.createP2PSession({ homeyDevice: record.hd, onStream(input) { input.resume(); }, onStop() {}, onError: error => source.ready.reject(error) });
+        callbacks.onStream(video, null, {});
+        if (amount) { video.write(Buffer.alloc(1)); if (amount > 1) video.write(Buffer.alloc(amount - 1)); }
+        assert.equal(record.mediaInput.bytes, amount);
+        assert.equal(entries.some(entry => entry.event === bucket), false, 'buckets are emitted only for a timeout');
+        const timeout = Object.assign(Error('The camera did not deliver independent video in time.'), { mediaPublic: true });
+        callbacks.onError(timeout); await turn();
+        assert.deepEqual(entries.filter(entry => entry.event.startsWith('media.input_') && entry.event !== 'media.input_bytes').map(entry => entry.event), [bucket]);
+        assert.equal(entries.filter(entry => entry.event === 'source.start_timeout').length, 1);
+        callbacks.onError(timeout); video.write(Buffer.alloc(10));
+        assert.equal(record.mediaInput.bytes, amount, 'late input after failure must not alter the deadline measurement');
+        assert.equal((await f.request('DELETE', `/v1/sessions/${record.id}`, { owner: OWNER, epoch: f.epoch })).status, 200);
+        const closedCount = entries.length;
+        video.write(Buffer.alloc(10)); callbacks.onError(timeout);
+        assert.equal(entries.length, closedCount);
+        assert.ok(entries.every(entry => Object.keys(entry).sort().join(',') === 'event,message'));
+    });
+});
+
+test('parent input counters saturate safely and reset for a replacement source without counting stale input', async t => {
+    const entries = [], callbacks = [];
+    const f = await fixture(t, { autoReady: false, serverOptions: {
+        onDiagnostic: entry => entries.push(entry),
+        createP2PSession: params => { callbacks.push(params); return { async start() {}, async close() {} }; },
+    } });
+    const opened = await f.open(), record = f.helper.records.get(opened.id), manager = f.managers.at(-1);
+    await record.startPromise;
+    const source = manager.sessions.get(record.serial);
+    const parameters = { homeyDevice: record.hd, onStream(input) { input.resume(); }, onStop() {}, onError: error => source.ready.reject(error) };
+    manager.options.createP2PSession(parameters);
+    const first = new PassThrough(), second = new PassThrough();
+    t.after(() => { first.destroy(); second.destroy(); });
+    callbacks[0].onStream(first, null, {}); first.write(Buffer.alloc(10));
+    const oldInput = record.mediaInput;
+    manager.options.createP2PSession(parameters);
+    assert.equal(record.mediaInput.bytes, 0);
+    first.write(Buffer.alloc(20));
+    assert.equal(oldInput.bytes, 10); assert.equal(record.mediaInput.bytes, 0);
+    callbacks[1].onStream(second, null, {});
+    record.mediaInput.bytes = Number.MAX_SAFE_INTEGER - 4;
+    second.write(Buffer.alloc(16)); second.write(Buffer.alloc(16));
+    assert.equal(record.mediaInput.bytes, Number.MAX_SAFE_INTEGER); assert.equal(Number.isSafeInteger(record.mediaInput.bytes), true);
+    callbacks[1].onError(Object.assign(Error('The camera did not deliver independent video in time.'), { mediaPublic: true }));
+    await turn();
+    assert.equal(entries.filter(entry => entry.event === 'media.input_at_least_256kib').length, 1);
+    assert.equal(JSON.stringify(entries).includes(String(Number.MAX_SAFE_INTEGER)), false, 'exact counters remain internal');
+});
 
 test('helper health and control endpoints require the persistent bearer secret', async t => {
     const f = await fixture(t, { connect: false });

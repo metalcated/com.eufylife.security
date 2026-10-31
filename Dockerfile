@@ -24,7 +24,8 @@ RUN npm test \
     && node scripts/check-media.cjs
 RUN --network=none node scripts/check-p2p-lifecycle.cjs \
     && node scripts/check-owned-p2p-lifecycle.cjs \
-    && node scripts/check-native-video-rsa.cjs
+    && node scripts/check-native-video-rsa.cjs \
+    && node scripts/check-t8423-codec.cjs
 RUN --network=none node scripts/check-camera-helper.cjs
 
 FROM verified AS installer

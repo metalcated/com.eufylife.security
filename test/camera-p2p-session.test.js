@@ -19,7 +19,7 @@ const deferred = () => {
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); await new Promise(setImmediate); };
 
 function harness(options = {}) {
-    const workers = [], timers = new Set(), calls = [], streams = [], errors = [];
+    const workers = [], timers = new Set(), calls = [], streams = [], errors = [], phases = [], corrections = [];
     let stops = 0;
     const rawStation = { station_sn: 'HOMEBASE_A', token: SECRET, member: { username: SECRET, admin_user_id: 'member-a' } };
     const rawDevice = { device_sn: 'CAMERA_A', station_sn: 'HOMEBASE_A', password: SECRET, channel: 1 };
@@ -60,8 +60,10 @@ function harness(options = {}) {
     factory(createRequire(filename), module, module.exports, path.dirname(filename), setTimer, timer => timers.delete(timer));
     const session = new module.exports({ client, homeyDevice, WorkerClass: FakeWorker, startupTimeoutMs: 101, shutdownTimeoutMs: 102, rpcTimeoutMs: 103, terminationTimeoutMs: 104,
         onStream(video, audio, metadata) { streams.push({ video, audio, metadata }); if (options.onStream) return options.onStream(video, audio, metadata); },
-        onStop() { stops++; }, onError(error) { errors.push(error); } });
-    return { session, workers, timers, calls, streams, errors, api, client, device, homeyDevice, originalStation, rawStation, rawDevice,
+        onStop() { stops++; }, onError(error) { errors.push(error); },
+        onPhase(phase) { phases.push(phase); if (options.onPhase) return options.onPhase(phase); },
+        onCodecCorrection(...args) { corrections.push(args); if (options.onCodecCorrection) return options.onCodecCorrection(...args); } });
+    return { session, workers, timers, calls, streams, errors, phases, corrections, api, client, device, homeyDevice, originalStation, rawStation, rawDevice,
         stops: () => stops,
         fire(delay) {
             const selected = [...timers].filter(timer => timer.delay === delay);
@@ -413,4 +415,70 @@ test('late cipher replies after close are discarded and cannot reenter the close
     cipher.resolve({ private_key: SECRET, token: SECRET }); await flush();
     assert.equal(worker.messages.length, count);
     assert.equal(h.timers.size, 0);
+});
+
+test('known progress phases are forwarded as bounded enum strings without changing the startup deadline', async () => {
+    const h = harness(); const started = h.session.start(); started.catch(() => {});
+    const worker = h.workers[0], timers = [...h.timers];
+    const phases = ['device-create', 'device-init', 'station-create', 'station-init', 'connect', 'start', 'stream'];
+    for (const phase of phases) worker.send({ type: 'phase', phase });
+    for (let count = 0; count < 100; count++) for (const phase of phases) worker.send({ type: 'phase', phase });
+    assert.deepEqual(h.phases, phases); assert.equal(h.session.phase, 'stream');
+    assert.deepEqual([...h.timers], timers, 'diagnostic progress changed the original startup deadline');
+    assert.equal(h.calls.length, 0); assert.equal(h.streams.length, 0); assert.equal(h.errors.length, 0);
+    const closed = h.close(); await assert.rejects(started, /cancelled/i); await closed;
+});
+
+test('malformed progress messages and arbitrary SDK details are ignored without exposing or retaining them', async () => {
+    const h = harness(); const started = h.session.start(); started.catch(() => {});
+    for (const message of [null, [], SECRET, { type: 'phase' }, { phase: 'connect' },
+        { type: 'phase', phase: SECRET }, { type: 'phase', phase: 'toString' }, { type: 'phase', phase: { message: SECRET } },
+        { type: 'phase', phase: 'connect', error: SECRET }, { type: 'phase', phase: 'connect', metadata: { token: SECRET } },
+        { type: 'phase', phase: 'connect', [Symbol('secret')]: SECRET }]) h.workers[0].send(message);
+    assert.deepEqual(h.phases, []); assert.equal(h.session.phase, null);
+    assert.equal(h.calls.length, 0); assert.equal(h.errors.length, 0);
+    h.workers[0].send({ type: 'phase', phase: 'connect' }); assert.deepEqual(h.phases, ['connect']);
+    assert.equal(JSON.stringify(h.phases).includes(SECRET), false);
+    const closed = h.close(); await assert.rejects(started, /cancelled/i); await closed;
+});
+
+test('progress callback exceptions and late phase messages cannot interrupt stream attachment or cleanup', async () => {
+    for (const reject of [false, true]) {
+        const h = harness({ onPhase() { if (reject) return Promise.reject(Error(SECRET)); throw Error(SECRET); } });
+        const started = h.session.start();
+        h.workers[0].send({ type: 'phase', phase: 'connect' }); await flush();
+        h.workers[0].send({ type: 'stream', metadata: { videoCodec: 0 } }); await started;
+        assert.equal(h.streams.length, 1); assert.equal(h.errors.length, 0);
+        const closing = h.close();
+        h.workers[0].send({ type: 'phase', phase: 'stream' }); await closing;
+        h.workers[0].send({ type: 'phase', phase: 'start' }); await flush();
+        assert.deepEqual(h.phases, ['connect']); assert.equal(h.session.phase, 'connect');
+        assert.equal(h.workers[0].terminateCalls, 1); assert.equal(h.timers.size, 0);
+    }
+});
+
+test('codec correction diagnostics accept only a single exact pair of different known numeric codecs', async () => {
+    const h = harness(); const start = h.session.start(); start.catch(() => {});
+    for (const message of [{ type: 'codec-correction' }, { type: 'codec-correction', from: 0, to: 0 },
+        { type: 'codec-correction', from: '0', to: 1 }, { type: 'codec-correction', from: -1, to: 1 },
+        { type: 'codec-correction', from: 0, to: 2 }, { type: 'codec-correction', from: 0, to: 1, metadata: SECRET },
+        { type: 'codec-correction', from: 0, to: 1, [Symbol('private')]: SECRET }]) h.workers[0].send(message);
+    assert.deepEqual(h.corrections, []);
+    for (let repeat = 0; repeat < 100; repeat++) h.workers[0].send({ type: 'codec-correction', from: 0, to: 1 });
+    assert.deepEqual(h.corrections, [[0, 1]]); assert.equal(h.errors.length, 0);
+    const closing = h.close(); await assert.rejects(start, /cancelled/); await closing;
+});
+
+test('codec diagnostic callback failures and late messages never affect video or cleanup', async () => {
+    for (const rejects of [true, false]) {
+        const h = harness({ onCodecCorrection() { if (rejects) return Promise.reject(Error(SECRET)); throw Error(SECRET); } });
+        const worker = await h.stream();
+        worker.send({ type: 'codec-correction', from: 1, to: 0 }); await flush();
+        assert.equal(h.streams.length, 1); assert.equal(h.errors.length, 0);
+        await h.close(); worker.send({ type: 'codec-correction', from: 0, to: 1 });
+        assert.deepEqual(h.corrections, [[1, 0]]); assert.equal(h.timers.size, 0);
+    }
+    const h = harness(); const start = h.session.start(); start.catch(() => {});
+    const closing = h.close(); h.workers[0].send({ type: 'codec-correction', from: 0, to: 1 });
+    await assert.rejects(start, /cancelled/); await closing; assert.deepEqual(h.corrections, []);
 });
