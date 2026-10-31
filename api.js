@@ -10,6 +10,8 @@ function wall(homey) {
 
 // Authenticated Homey API only. Diagnostics contain neither media URLs nor cloud records.
 module.exports = {
+    async getCameraSettings({ homey }) { return homey.app.getCameraSettings(); },
+    async setCameraSettings({ homey, body }) { return homey.app.setCameraSettings(body); },
     async getCameraHelperStatus({ homey }) {
         return homey.app.FfmpegManager.helperClient.health();
     },

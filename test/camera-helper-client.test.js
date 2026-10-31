@@ -22,7 +22,8 @@ function harness(t, options = {}) {
     const records = new Map(), tombstones = new Set(), calls = [], apiCalls = [], timers = new Set();
     let counter = 1, instance = uuid(900), ownerEpoch, local = options.local || 0, clock = 0;
     const response = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
-    const state = { settings, records, tombstones, calls, apiCalls, timers, failDelete: false, hook: null };
+    const state = { settings, records, tombstones, calls, apiCalls, timers, failDelete: false, hook: null, remoteLimit: 4 };
+    const capabilities = options.streamLimits ? { capabilities: { streamLimitSettings: true } } : {};
     const api = { isConnected: () => true,
         getCipher: async (...args) => { apiCalls.push(['getCipher', ...args]); return state.cipher ? state.cipher(...args) : { private_key: 'own-key', token: SECRET }; },
         getPublicKey: async (...args) => { apiCalls.push(['getPublicKey', ...args]); return 'own-public'; },
@@ -51,8 +52,9 @@ function harness(t, options = {}) {
             const intercepted = await state.hook(pathname, request, body);
             if (intercepted !== undefined) return intercepted;
         }
-        if (pathname === '/v1/health') return response({ protocol: 1, version: '0.1.0', sdk: '4.2.6', instance });
-        if (pathname === '/v1/connect') { ownerEpoch = body.epoch; return response({ protocol: 1, version: '0.1.0', sdk: '4.2.6', instance, ...body }); }
+        if (pathname === '/v1/health') return response({ protocol: 1, version: '0.1.0', sdk: '4.2.6', instance, ...capabilities });
+        if (pathname === '/v1/limits') { assert.equal(body.epoch, ownerEpoch); state.remoteLimit = body.maxStreams; return response({ maxStreams: body.maxStreams }); }
+        if (pathname === '/v1/connect') { if (ownerEpoch !== body.epoch) state.remoteLimit = 4; ownerEpoch = body.epoch; return response({ protocol: 1, version: '0.1.0', sdk: '4.2.6', instance, ...body }); }
         if (pathname === '/v1/sessions') {
             if (tombstones.has(body.requestId)) return response({ error: SECRET }, 409);
             assert.equal(body.epoch, ownerEpoch); assert.equal(JSON.stringify(body.metadata).includes(SECRET), false);
@@ -100,7 +102,7 @@ function harness(t, options = {}) {
     t.after(async () => { state.failDelete = false; state.hook = null; await client.dispose().catch(() => {}); for (const record of records.values()) closeEvents(record); });
     return Object.assign(state, { client, homey, account, station, camera, response, local: count => { local = count; }, advance: ms => { clock += ms; },
         emit(record, message) { for (const stream of record.streams) { try { stream.enqueue(Buffer.from(`${JSON.stringify(message)}\n`)); } catch {} } },
-        restart() { for (const record of records.values()) closeEvents(record); records.clear(); instance = uuid(901); },
+        restart() { for (const record of records.values()) closeEvents(record); records.clear(); instance = uuid(901); state.remoteLimit = 4; ownerEpoch = undefined; },
         fire(delay) { const selected = [...timers].filter(timer => timer.delay === delay); assert.ok(selected.length, `missing timer ${delay}`);
             for (const timer of selected) { timers.delete(timer); timer.fn(); } },
     });
@@ -170,9 +172,9 @@ test('privacy and replaced account identities revoke the helper lease before rep
 
 test('global source capacity includes local sources, pending leases and failed cleanup until retry proves cancellation', async t => {
     const h = harness(t, { local: 3 }); await h.client.videoUrl(h.camera('A'));
-    await assert.rejects(h.client.videoUrl(h.camera('B')), /four active/);
+    await assert.rejects(h.client.videoUrl(h.camera('B')), /stream limit \(4\)/);
     h.failDelete = true; await assert.rejects(h.client.stop('A'), error => error.mediaPublic && error.cameraHelper === true);
-    assert.equal(h.client.sourceCount(), 1); await assert.rejects(h.client.videoUrl(h.camera('B')), /four active/);
+    assert.equal(h.client.sourceCount(), 1); await assert.rejects(h.client.videoUrl(h.camera('B')), /stream limit \(4\)/);
     h.failDelete = false; await h.client.stop('A'); assert.equal(h.client.sourceCount(), 0);
     await h.client.videoUrl(h.camera('B')); assert.equal(h.client.sourceCount(), 1);
 });
@@ -453,7 +455,7 @@ test('failed initial cancellation holds capacity and retries only cleanup until 
     await assert.rejects(h.client.videoUrl(camera), error => error.mediaPublic);
     const closing = h.client.entries.get('A');
     assert.equal(closing.closing, true); assert.equal(h.client.sourceCount(), 1);
-    await assert.rejects(h.client.videoUrl(h.camera('B')), /four active/);
+    await assert.rejects(h.client.videoUrl(h.camera('B')), /stream limit \(4\)/);
     assert.equal(h.calls.filter(call => call.pathname === '/v1/sessions').length, 1);
     assert.ok([...h.timers].every(timer => ![7, 13].includes(timer.delay)), 'failed startup may retry cancellation but not creation');
     h.failDelete = false; h.hook = null;
@@ -470,7 +472,7 @@ test('four pending remote allocations reserve all source capacity before any med
     h.hook = async pathname => { if (pathname === '/v1/sessions') await barrier.promise; };
     const pending = ['A', 'B', 'C', 'D'].map(serial => { const promise = h.client.videoUrl(h.camera(serial)); promise.catch(() => {}); return promise; });
     await flush(); assert.equal(h.client.sourceCount(), 4);
-    await assert.rejects(h.client.videoUrl(h.camera('E')), /four active/);
+    await assert.rejects(h.client.videoUrl(h.camera('E')), /stream limit \(4\)/);
     await h.client.reset(); barrier.resolve(); await Promise.allSettled(pending); await flush();
     assert.equal(h.client.sourceCount(), 0); assert.equal(h.records.size, 0);
     assert.equal(h.tombstones.size, 4);
@@ -541,4 +543,132 @@ test('a minute boundary cannot reset the key-read budget while an earlier accoun
     pending.resolve({ private_key: 'own-key' }); await flush(); h.cipher = null;
     h.emit(record, { id: 34, method: 'getCipher', args: [7, 'ADMIN'] }); await flush();
     assert.equal(h.apiCalls.length, 33); assert.equal(record.replies.at(-1).value.private_key, 'own-key');
+});
+
+test('old helpers retain default four streams and reject custom limits before allocating a source', async t => {
+    const h = harness(t);
+    await h.client.videoUrl(h.camera('A'));
+    assert.equal(h.calls.some(call => call.pathname === '/v1/limits'), false);
+    for (const maxStreams of [5, null]) {
+        h.settings.set('camera_stream_limit', { maxStreams });
+        assert.deepEqual(h.client.getStreamLimitStatus(), { applied: false });
+        await assert.rejects(h.client.videoUrl(h.camera('B')), /Update the camera media helper/);
+        assert.equal(h.records.size, 1, 'an incompatible helper received a new source');
+    }
+    h.settings.set('camera_stream_limit', { maxStreams: 4 });
+    assert.deepEqual(await h.client.syncStreamLimit(), { applied: true });
+    assert.equal(h.records.size, 1);
+});
+
+test('configured limits include concurrent pending sources, allow existing viewers after lowering, and support No limit', async t => {
+    const h = harness(t, { streamLimits: true }), ready = deferred();
+    h.settings.set('camera_stream_limit', { maxStreams: 6 });
+    h.hook = async pathname => {
+        if (pathname.endsWith('/ready')) { await ready.promise; return h.response({ ready: true, id: pathname.split('/')[3] }); }
+    };
+    const cameras = Array.from('ABCDEF', label => h.camera(label));
+    const pending = cameras.map(camera => h.client.videoUrl(camera)); pending.forEach(promise => promise.catch(() => {}));
+    await flush();
+    assert.equal(h.client.sourceCount(), 6); assert.equal(h.records.size, 6);
+    assert.equal(h.remoteLimit, 6);
+    assert.ok(h.calls.findIndex(call => call.pathname === '/v1/limits') < h.calls.findIndex(call => call.pathname === '/v1/sessions'));
+    await assert.rejects(h.client.videoUrl(h.camera('G')), /stream limit \(6\)/);
+    ready.resolve(); const active = await Promise.all(pending); h.hook = null;
+    h.settings.set('camera_stream_limit', { maxStreams: 2 }); await h.client.syncStreamLimit();
+    assert.equal(h.records.size, 6);
+    assert.equal(await h.client.videoUrl(cameras[0]), active[0]);
+    await assert.rejects(h.client.videoUrl(h.camera('G')), /stream limit \(2\)/);
+    h.settings.set('camera_stream_limit', { maxStreams: null }); await h.client.syncStreamLimit();
+    await Promise.all(Array.from('GHIJK', label => h.client.videoUrl(h.camera(label))));
+    assert.equal(h.client.sourceCount(), 11); assert.equal(h.remoteLimit, null);
+});
+
+test('limit synchronization serializes updates, applies the latest saved value, and deduplicates matching writes', async t => {
+    const h = harness(t, { streamLimits: true }), gate = deferred(); let active = 0, peak = 0;
+    h.hook = async (pathname, request, body) => {
+        if (pathname !== '/v1/limits') return;
+        active++; peak = Math.max(peak, active);
+        if (body.maxStreams === 6) await gate.promise;
+        active--; h.remoteLimit = body.maxStreams;
+        return h.response({ maxStreams: body.maxStreams });
+    };
+    h.settings.set('camera_stream_limit', { maxStreams: 6 }); const first = h.client.syncStreamLimit(); await flush();
+    h.settings.set('camera_stream_limit', { maxStreams: 9 }); const second = h.client.syncStreamLimit();
+    h.settings.set('camera_stream_limit', { maxStreams: null }); const third = h.client.syncStreamLimit();
+    gate.resolve(); await Promise.all([first, second, third]);
+    assert.equal(peak, 1);
+    assert.deepEqual(h.calls.filter(call => call.pathname === '/v1/limits').map(call => call.body.maxStreams), [6, null]);
+    assert.deepEqual(h.client.getStreamLimitStatus(), { applied: true });
+    await h.client.syncStreamLimit(); assert.equal(h.calls.filter(call => call.pathname === '/v1/limits').length, 2);
+    h.settings.delete('camera_helper_connection');
+    assert.deepEqual(await h.client.syncStreamLimit(), { applied: true });
+    assert.deepEqual(h.client.getStreamLimitStatus(), { applied: true });
+});
+
+test('Stop during a pending limit update cancels the reservation without a late source allocation', async t => {
+    const h = harness(t, { streamLimits: true }), gate = deferred();
+    h.settings.set('camera_stream_limit', { maxStreams: null });
+    h.hook = async pathname => { if (pathname === '/v1/limits') { await gate.promise; return h.response({ maxStreams: null }); } };
+    const pending = h.client.videoUrl(h.camera('A')); pending.catch(() => {}); await flush();
+    assert.equal(h.client.sourceCount(), 1);
+    await h.client.stop('A'); gate.resolve();
+    await assert.rejects(pending); assert.equal(h.client.sourceCount(), 0);
+    assert.equal(h.calls.some(call => call.pathname === '/v1/sessions'), false);
+});
+
+test('helper restart reapplies the saved custom limit before recovering its camera lease', async t => {
+    const h = harness(t, { streamLimits: true }); h.settings.set('camera_stream_limit', { maxStreams: 7 });
+    const camera = h.camera('A'), url = await h.client.videoUrl(camera);
+    const boundary = h.calls.length; h.restart(); h.fire(20); await flush(); h.fire(7); await flush();
+    assert.equal(h.remoteLimit, 7); assert.equal(await h.client.videoUrl(camera), url);
+    const recovered = h.calls.slice(boundary);
+    assert.ok(recovered.findIndex(call => call.pathname === '/v1/limits') < recovered.findIndex(call => call.pathname === '/v1/sessions'));
+});
+
+test('an idle helper restart revalidates cached health and reapplies unchanged No limit before the next camera', async t => {
+    const h = harness(t, { streamLimits: true }); h.settings.set('camera_stream_limit', { maxStreams: null });
+    await h.client.syncStreamLimit(); assert.equal(h.client.sourceCount(), 0); assert.equal(h.remoteLimit, null);
+    const boundary = h.calls.length; h.restart();
+    await h.client.syncStreamLimit();
+    assert.equal(h.remoteLimit, null);
+    assert.deepEqual(h.calls.slice(boundary).map(call => call.pathname), ['/v1/health', '/v1/connect', '/v1/limits']);
+    await h.client.videoUrl(h.camera('A'));
+    assert.equal(h.client.entries.get('A').instance, uuid(901), 'prepare retained its pre-synchronization helper instance');
+});
+
+test('an idle helper restart applies a changed numeric setting and transient stale-epoch responses retry once', async t => {
+    const h = harness(t, { streamLimits: true }); h.settings.set('camera_stream_limit', { maxStreams: 6 });
+    await h.client.syncStreamLimit(); h.restart(); h.settings.set('camera_stream_limit', { maxStreams: 9 });
+    let refused = false;
+    h.hook = pathname => {
+        if (pathname === '/v1/limits' && !refused) { refused = true; return h.response({}, 409); }
+    };
+    await h.client.syncStreamLimit(); assert.equal(h.remoteLimit, 9);
+    assert.equal(h.calls.filter(call => call.pathname === '/v1/limits').length, 3);
+    assert.deepEqual(h.client.getStreamLimitStatus(), { applied: true });
+    h.settings.set('camera_stream_limit', { maxStreams: 10 });
+    h.hook = pathname => pathname === '/v1/limits' ? h.response({}, 409) : undefined;
+    const boundary = h.calls.length;
+    await assert.rejects(h.client.syncStreamLimit());
+    assert.equal(h.calls.slice(boundary).filter(call => call.pathname === '/v1/limits').length, 2, 'stale authorization caused an unbounded retry');
+    assert.deepEqual(h.client.getStreamLimitStatus(), { applied: false });
+    assert.equal(h.calls.some(call => call.pathname === '/v1/sessions'), false);
+});
+
+test('unreachable health invalidates a previously applied cached limit without replaying settings or cameras', async t => {
+    const h = harness(t, { streamLimits: true }); await h.client.syncStreamLimit();
+    const boundary = h.calls.length; h.hook = () => { throw Error(SECRET); };
+    await assert.rejects(h.client.syncStreamLimit(), error => error.mediaPublic && !error.message.includes(SECRET));
+    assert.deepEqual(h.client.getStreamLimitStatus(), { applied: false });
+    assert.deepEqual(h.calls.slice(boundary).map(call => call.pathname), ['/v1/health']);
+});
+
+test('a delayed health response after reset cannot reconnect an obsolete synchronization', async t => {
+    const h = harness(t, { streamLimits: true }), health = deferred();
+    h.hook = pathname => pathname === '/v1/health' ? health.promise : undefined;
+    const syncing = h.client.syncStreamLimit(); syncing.catch(() => {}); await flush();
+    await h.client.reset();
+    health.resolve(h.response({ protocol: 1, version: '0.2.0', sdk: '4.2.6', instance: uuid(900), capabilities: { streamLimitSettings: true } }));
+    await assert.rejects(syncing);
+    assert.deepEqual(h.calls.map(call => call.pathname), ['/v1/health']);
 });

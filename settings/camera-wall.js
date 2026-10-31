@@ -7,9 +7,19 @@
   const ICE_TIMEOUT_MS = 12000;
   const CONNECT_TIMEOUT_MS = 60000;
   const state = { homey: null, cameras: new Map(), selected: new Set(), tiles: new Map(), views: new Map(),
-    configured: false, maxViews: 4, selectionInitialized: false, loading: false, catalogGeneration: 0,
-    modalOpen: false, saving: false, previousFocus: null, disposed: false, selectionWrites: Promise.resolve() };
+    configured: false, maxViews: null, limitKnown: false, limitRevision: 0, selectionInitialized: false, loading: false, catalogGeneration: 0,
+    modalOpen: false, saving: false, previousFocus: null, settingsOpen: false, settingsSaving: false, settingsLoading: false,
+    settingsLoaded: false, settingsDirty: false, settingsGeneration: 0, settingsPreviousFocus: null, settingsValue: undefined,
+    settingsRefreshPending: false, settingsEventTimer: null,
+    disposed: false, selectionWrites: Promise.resolve() };
   const $ = (id) => document.getElementById(id);
+  const validLimit = (value) => value === null || Number.isSafeInteger(value) && value > 0;
+  function hasSelectionRoom(camera) {
+    if (camera?.usesStreamLimit === false || !state.limitKnown || state.maxViews === null) return true;
+    let limited = 0;
+    for (const id of state.selected) if (state.cameras.get(id)?.usesStreamLimit !== false && ++limited >= state.maxViews) return false;
+    return true;
+  }
 
   function api(method, route, body, timeout = 30000, onLateResult = null) {
     return new Promise((resolve, reject) => {
@@ -67,7 +77,7 @@
   }
 
   function saveSelection() {
-    const ids = [...state.selected].filter((id) => state.cameras.has(id)).slice(0, state.maxViews);
+    const ids = [...state.selected].filter((id) => state.cameras.has(id));
     // Serialize preference writes so an earlier choice cannot overwrite a later one.
     state.selectionWrites = state.selectionWrites.catch(() => {}).then(() => settingsCall('set', 'camera_wall_selection', ids)).catch(() => {
       if (!state.disposed) message('Camera choices could not be saved. They will be kept for this visit.');
@@ -78,7 +88,7 @@
     try {
       const ids = await settingsCall('get', 'camera_wall_selection');
       if (state.disposed || !Array.isArray(ids)) return;
-      state.selected = new Set(ids.filter((id) => typeof id === 'string' && id).slice(0, 4));
+      state.selected = new Set(ids.filter((id) => typeof id === 'string' && id));
       state.selectionInitialized = true;
     } catch (_) { /* Cameras still load if the saved preference is unavailable. */ }
   }
@@ -109,9 +119,9 @@
     $('play-selected').disabled = !state.configured || !playable || state.disposed;
     $('stop-all').disabled = state.views.size === 0;
     $('refresh-button').disabled = state.loading;
-    $('selection-count').textContent = `${state.selected.size} of ${state.maxViews} selected`;
+    $('selection-count').textContent = `${state.selected.size} selected${state.limitKnown ? state.maxViews === null ? ' · No limit' : ` · Stream limit ${state.maxViews}` : ''}`;
     $('setup-notice').hidden = state.configured;
-    for (const input of $('camera-options').querySelectorAll('input')) input.disabled = !input.checked && state.selected.size >= state.maxViews;
+    for (const input of $('camera-options').querySelectorAll('input')) input.disabled = !input.checked && !hasSelectionRoom(state.cameras.get(input.value));
   }
 
   function createTile(camera) {
@@ -149,7 +159,7 @@
       input.value = camera.id;
       input.checked = state.selected.has(camera.id);
       input.addEventListener('change', () => {
-        if (input.checked && state.selected.size < state.maxViews) state.selected.add(camera.id);
+        if (input.checked && hasSelectionRoom(camera)) state.selected.add(camera.id);
         else { input.checked = false; state.selected.delete(camera.id); stopView(camera.id); }
         renderGrid();
         saveSelection();
@@ -188,6 +198,7 @@
 
   async function loadCameras() {
     const generation = ++state.catalogGeneration;
+    const limitRevision = state.limitRevision;
     state.loading = true;
     updateControls();
     try {
@@ -195,21 +206,20 @@
       if (state.disposed || generation !== state.catalogGeneration) return;
       if (!result || !Array.isArray(result.cameras) || typeof result.configured !== 'boolean') throw Error('Invalid inventory');
       state.configured = result.configured;
-      state.maxViews = Number.isInteger(result.maxViews) ? Math.max(1, Math.min(4, result.maxViews)) : 4;
+      if (validLimit(result.maxViews) && limitRevision === state.limitRevision) applyLimit(result.maxViews);
       const cameras = new Map();
       for (const item of result.cameras) if (item && typeof item.id === 'string' && item.id && !cameras.has(item.id)) {
         cameras.set(item.id, { id: item.id, name: typeof item.name === 'string' && item.name ? item.name : 'Camera',
-          available: item.available === true, videoRegistered: item.videoRegistered === true });
+          available: item.available === true, videoRegistered: item.videoRegistered === true, usesStreamLimit: item.usesStreamLimit !== false });
       }
       state.cameras = cameras;
       for (const id of state.selected) if (!cameras.has(id)) { state.selected.delete(id); stopView(id); }
       for (const [id] of state.views) if (!state.configured || !canPlay(cameras.get(id))) stopView(id);
       if (!state.selectionInitialized) {
         const candidates = [...cameras.values()].sort((a, b) => Number(canPlay(b)) - Number(canPlay(a)));
-        candidates.slice(0, state.maxViews).forEach((camera) => state.selected.add(camera.id));
+        for (const camera of candidates) if (hasSelectionRoom(camera)) state.selected.add(camera.id);
         state.selectionInitialized = true;
       }
-      while (state.selected.size > state.maxViews) { const id = [...state.selected].pop(); state.selected.delete(id); stopView(id); }
       const available = [...cameras.values()].filter(canPlay).length;
       $('inventory-status').textContent = cameras.size ? `${available} of ${cameras.size} cameras ready for live view` : 'No cameras are ready for this wall yet';
       message(cameras.size ? '' : 'Pair a camera with Eufy Security in Homey, then refresh this page.');
@@ -352,8 +362,153 @@
     } catch (_) { message('Fullscreen is not available in this Homey window. You can keep watching here.'); }
   }
 
+  function applyLimit(value) {
+    state.maxViews = value; state.limitKnown = true; state.limitRevision++;
+    updateControls();
+  }
+
+  function settingsResult(result) {
+    return result && validLimit(result.maxStreams) && Number.isSafeInteger(result.defaultMaxStreams) && result.defaultMaxStreams > 0
+      && typeof result.saved === 'boolean' && ['applied', 'pending'].includes(result.applyStatus);
+  }
+
+  function settingsStatus(result) {
+    const pending = result.applyStatus === 'pending';
+    $('camera-settings-status').dataset.tone = pending ? 'pending' : 'info';
+    $('camera-settings-status').textContent = pending
+      ? 'This setting will apply when camera streaming reconnects or is updated.'
+      : result.saved ? 'Shared across your Eufy camera views in Homey.' : 'Using the default stream limit. Save to change it for all your Eufy camera views.';
+  }
+
+  function settingsError(error, saving) {
+    const detail = `${error?.code || ''} ${error?.statusCode || ''} ${error?.message || ''}`.toLowerCase();
+    if (/401|403|permission|forbidden|unauthori/.test(detail)) return 'Check your access to this Homey, then try again.';
+    return saving ? 'The change could not be confirmed. Check the Homey connection, then try again or reopen Camera settings.'
+      : 'Camera settings could not be loaded. Check the Homey connection, then retry.';
+  }
+
+  function updateSettingsControls() {
+    const busy = state.settingsSaving || state.settingsLoading;
+    $('stream-limit').disabled = busy || !state.settingsLoaded || $('stream-no-limit').getAttribute('aria-checked') === 'true';
+    $('stream-no-limit').disabled = busy || !state.settingsLoaded;
+    $('save-camera-settings').disabled = busy || !state.settingsLoaded;
+    for (const id of ['cancel-camera-settings', 'close-camera-settings', 'wall-key-setup', 'retry-camera-settings']) $(id).disabled = state.settingsSaving;
+    $('camera-settings-dialog').setAttribute('aria-busy', String(busy));
+  }
+
+  async function loadCameraSettings({ dialog = false } = {}) {
+    if (state.disposed || state.settingsSaving) return false;
+    const generation = ++state.settingsGeneration;
+    if (dialog && !state.settingsDirty) {
+      state.settingsLoading = true; state.settingsLoaded = false;
+      $('camera-settings-status').dataset.tone = 'info';
+      $('camera-settings-status').textContent = 'Loading camera settings…';
+      $('camera-settings-error').hidden = true; $('retry-camera-settings').hidden = true;
+      updateSettingsControls();
+    }
+    try {
+      const result = await api('GET', '/camera-settings', null);
+      if (state.disposed || generation !== state.settingsGeneration) return false;
+      if (!settingsResult(result)) throw Error('Invalid camera settings');
+      const changedElsewhere = state.settingsValue !== undefined && state.settingsValue !== result.maxStreams;
+      state.settingsValue = result.maxStreams;
+      applyLimit(result.maxStreams);
+      if (state.settingsOpen && !state.settingsDirty) {
+        $('stream-no-limit').setAttribute('aria-checked', String(result.maxStreams === null));
+        $('stream-limit').value = String(result.maxStreams ?? result.defaultMaxStreams);
+        $('stream-limit').removeAttribute('aria-invalid');
+        state.settingsLoaded = true; settingsStatus(result);
+        $('camera-settings-error').hidden = true; $('retry-camera-settings').hidden = true;
+      } else if (state.settingsOpen && state.settingsDirty && changedElsewhere) {
+        $('camera-settings-status').dataset.tone = 'info';
+        $('camera-settings-status').textContent = 'Changed on another device. Save your choice or Cancel to keep the saved setting.';
+      }
+      return true;
+    } catch (error) {
+      if (!state.disposed && generation === state.settingsGeneration && state.settingsOpen && dialog) {
+        $('camera-settings-status').dataset.tone = 'info';
+        $('camera-settings-status').textContent = '';
+        $('camera-settings-error').textContent = settingsError(error, false);
+        $('camera-settings-error').hidden = false; $('retry-camera-settings').hidden = false;
+      }
+      return false;
+    } finally {
+      if (generation === state.settingsGeneration) {
+        state.settingsLoading = false; updateSettingsControls();
+        if (state.settingsOpen && document.activeElement === $('camera-settings-dialog')) {
+          (state.settingsLoaded ? $('stream-no-limit').getAttribute('aria-checked') === 'true' ? $('stream-no-limit') : $('stream-limit') : $('retry-camera-settings')).focus();
+        }
+      }
+    }
+  }
+
+  function openCameraSettings() {
+    if (state.settingsOpen || state.modalOpen || state.disposed) return;
+    state.settingsPreviousFocus = document.activeElement;
+    state.settingsOpen = true; state.settingsDirty = false; state.settingsLoaded = false;
+    $('camera-settings-modal').hidden = false; $('camera-wall').inert = true;
+    document.body.classList.add('modal-open'); $('camera-settings-dialog').focus();
+    loadCameraSettings({ dialog: true });
+  }
+
+  function closeCameraSettings() {
+    if (state.settingsSaving) return;
+    state.settingsOpen = false; state.settingsDirty = false; ++state.settingsGeneration;
+    state.settingsLoading = false;
+    $('camera-settings-modal').hidden = true; $('camera-wall').inert = false;
+    document.body.classList.remove('modal-open'); state.settingsPreviousFocus?.focus();
+  }
+
+  async function saveCameraSettings(event) {
+    event.preventDefault();
+    if (state.settingsSaving || state.settingsLoading || !state.settingsLoaded) return;
+    const raw = $('stream-limit').value.trim();
+    const unlimited = $('stream-no-limit').getAttribute('aria-checked') === 'true';
+    const value = unlimited ? null : /^\d+$/.test(raw) ? Number(raw) : NaN;
+    if (!validLimit(value)) {
+      $('camera-settings-error').textContent = 'Enter a whole number greater than zero, or choose No limit.';
+      $('camera-settings-error').hidden = false; $('stream-limit').setAttribute('aria-invalid', 'true'); $('stream-limit').focus(); return;
+    }
+    state.settingsSaving = true; ++state.settingsGeneration;
+    $('camera-settings-error').hidden = true; $('save-camera-settings').textContent = 'Saving…';
+    $('camera-settings-status').dataset.tone = 'info';
+    $('camera-settings-status').textContent = 'Saving camera settings…'; updateSettingsControls();
+    try {
+      const result = await api('PUT', '/camera-settings', { maxStreams: value }, 30000, () => { if (!state.disposed) loadCameraSettings(); });
+      if (state.disposed) return;
+      if (!settingsResult(result) || result.saved !== true || result.maxStreams !== value) throw Error('Camera settings not confirmed');
+      state.settingsValue = result.maxStreams;
+      applyLimit(result.maxStreams);
+      state.settingsSaving = false; closeCameraSettings();
+      message(result.applyStatus === 'pending'
+        ? 'Stream limit saved. It will apply when camera streaming reconnects or is updated.'
+        : 'Eufy stream limit saved for web, iOS and Android. Current feeds keep playing.');
+    } catch (error) {
+      if (!state.disposed) {
+        $('camera-settings-status').dataset.tone = 'info';
+        $('camera-settings-status').textContent = '';
+        $('camera-settings-error').textContent = settingsError(error, true); $('camera-settings-error').hidden = false;
+      }
+    } finally {
+      state.settingsSaving = false; $('save-camera-settings').textContent = 'Save'; updateSettingsControls();
+      if (state.settingsOpen) $('save-camera-settings').focus();
+      if (state.settingsRefreshPending) { state.settingsRefreshPending = false; loadCameraSettings(); }
+    }
+  }
+
+  function refreshSettingsSoon() {
+    if (state.disposed) return;
+    clearTimeout(state.settingsEventTimer);
+    state.settingsEventTimer = setTimeout(() => {
+      state.settingsEventTimer = null;
+      if (state.disposed) return;
+      if (state.settingsSaving) state.settingsRefreshPending = true;
+      else loadCameraSettings({ dialog: state.settingsOpen });
+    }, 200);
+  }
+
   function openSetup() {
-    if (state.modalOpen || state.disposed) return;
+    if (state.modalOpen || state.settingsOpen || state.disposed) return;
     state.previousFocus = document.activeElement;
     state.modalOpen = true;
     $('api-key').value = '';
@@ -412,11 +567,12 @@
   }
 
   function handleModalKeys(event) {
-    if (!state.modalOpen) return;
-    if (event.key === 'Escape') { event.preventDefault(); closeSetup(); }
+    if (!state.modalOpen && !state.settingsOpen) return;
+    const modal = $(state.settingsOpen ? 'camera-settings-modal' : 'setup-modal');
+    if (event.key === 'Escape') { event.preventDefault(); if (state.settingsOpen) closeCameraSettings(); else closeSetup(); }
     if (event.key !== 'Tab') return;
-    const focusable = [...$('setup-modal').querySelectorAll('button:not(:disabled), input:not(:disabled), [tabindex="0"]')];
-    if (!focusable.length) { event.preventDefault(); return; }
+    const focusable = [...modal.querySelectorAll('button:not(:disabled), input:not(:disabled), [tabindex="0"]')].filter((node) => !node.closest('[hidden]'));
+    if (!focusable.length) { event.preventDefault(); modal.querySelector('[role="dialog"]').focus(); return; }
     const first = focusable[0], last = focusable[focusable.length - 1];
     if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
     else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
@@ -425,12 +581,24 @@
   window.onHomeyReady = (Homey) => {
     if (state.homey) return;
     state.homey = Homey;
-    $('setup-button').addEventListener('click', openSetup);
+    $('setup-button').addEventListener('click', openCameraSettings);
+    $('close-camera-settings').addEventListener('click', closeCameraSettings);
+    $('cancel-camera-settings').addEventListener('click', closeCameraSettings);
+    $('camera-settings-form').addEventListener('submit', saveCameraSettings);
+    $('stream-no-limit').addEventListener('click', () => {
+      const on = $('stream-no-limit').getAttribute('aria-checked') !== 'true';
+      $('stream-no-limit').setAttribute('aria-checked', String(on)); state.settingsDirty = true;
+      $('stream-limit').removeAttribute('aria-invalid'); updateSettingsControls();
+      if (!on) $('stream-limit').focus();
+    });
+    $('stream-limit').addEventListener('input', () => { state.settingsDirty = true; $('stream-limit').removeAttribute('aria-invalid'); });
+    $('retry-camera-settings').addEventListener('click', () => { state.settingsDirty = false; loadCameraSettings({ dialog: true }); });
+    $('wall-key-setup').addEventListener('click', () => { closeCameraSettings(); openSetup(); });
     $('connect-button').addEventListener('click', openSetup);
     $('close-setup').addEventListener('click', closeSetup);
     $('cancel-setup').addEventListener('click', closeSetup);
     $('setup-form').addEventListener('submit', saveSetup);
-    $('refresh-button').addEventListener('click', loadCameras);
+    $('refresh-button').addEventListener('click', () => { loadCameras(); loadCameraSettings({ dialog: state.settingsOpen }); });
     $('play-selected').addEventListener('click', () => { message(); for (const id of state.selected) startView(id); });
     $('stop-all').addEventListener('click', () => stopAll());
     $('wall-fullscreen').hidden = !$('camera-grid').requestFullscreen;
@@ -438,13 +606,19 @@
     document.addEventListener('keydown', handleModalKeys);
     document.addEventListener('visibilitychange', () => {
       if (document.hidden && state.views.size) { stopAll(); message('Feeds paused while this page was in the background. Select Play selected to resume.'); }
+      else if (!document.hidden) loadCameraSettings({ dialog: state.settingsOpen });
     });
+    window.addEventListener('focus', () => { if (!document.hidden) loadCameraSettings({ dialog: state.settingsOpen }); });
+    if (typeof Homey.on === 'function') {
+      Homey.on('settings.set', refreshSettingsSoon);
+      Homey.on('settings.unset', refreshSettingsSoon);
+    }
     window.addEventListener('pagehide', (event) => {
       stopAll();
       $('api-key').value = '';
-      if (!event.persisted) { state.disposed = true; ++state.catalogGeneration; }
+      if (!event.persisted) { state.disposed = true; ++state.catalogGeneration; ++state.settingsGeneration; clearTimeout(state.settingsEventTimer); }
     });
     Homey.ready();
-    restoreSelection().then(() => { if (!state.disposed) loadCameras(); });
+    restoreSelection().then(() => { if (!state.disposed) { loadCameras(); loadCameraSettings(); } });
   };
 })();

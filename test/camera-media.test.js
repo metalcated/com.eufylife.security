@@ -258,11 +258,46 @@ test('helper reservations share the global source cap with legacy media and a si
     const h = harness(t, { managerOptions: { helperClient: helper } });
     const legacy = h.camera('LEGACY', 'BASE_A'); await h.manager.getSession(legacy); await h.deliver(legacy);
     assert.equal(h.manager.sourceCount(), 4);
-    await assert.rejects(h.manager.getSession(h.camera('EXTRA', 'BASE_B')), /4 active camera/);
+    await assert.rejects(h.manager.getSession(h.camera('EXTRA', 'BASE_B')), /stream limit \(4\)/);
     await h.manager.stopStream('REMOTE');
     assert.deepEqual(helper.calls, [['stop', 'REMOTE']]);
     assert.equal(h.manager.sessions.has('LEGACY'), true);
     assert.equal(h.calls.some(([name]) => name === 'stop'), false);
+});
+
+test('saved limits apply dynamically to pending and closing sources without stopping existing cameras', async t => {
+    const closing = deferred();
+    t.after(() => closing.resolve());
+    const h = harness(t, { isolated: true, closeAdapter: adapter => adapter.serial === 'CAMERA_A' ? closing.promise : undefined });
+    h.settings.set('camera_stream_limit', { maxStreams: 6 });
+    const cameras = Array.from('ABCDEF', label => h.camera(`CAMERA_${label}`));
+    const sessions = await Promise.all(cameras.map(camera => h.manager.getSession(camera)));
+    await flush();
+    assert.equal(h.manager.sourceCount(), 6); assert.equal(h.adapters.length, 6);
+    await assert.rejects(h.manager.getSession(h.camera('CAMERA_G')), /stream limit \(6\)/);
+    h.settings.set('camera_stream_limit', { maxStreams: 2 });
+    assert.equal(await h.manager.getSession(cameras[0]), sessions[0]);
+    assert.equal(h.adapters.some(adapter => adapter.closes), false);
+    const stopping = h.manager.stopStream('CAMERA_A'); await flush();
+    assert.equal(h.manager.sourceCount(), 6, 'closing sources disappeared from capacity before cleanup');
+    await assert.rejects(h.manager.getSession(h.camera('CAMERA_G')), /stream limit \(2\)/);
+    closing.resolve(); await stopping;
+    assert.equal(h.manager.sourceCount(), 5);
+    h.settings.set('camera_stream_limit', { maxStreams: null });
+    await Promise.all(Array.from('GHIJK', label => h.manager.getSession(h.camera(`CAMERA_${label}`))));
+    assert.equal(h.manager.sourceCount(), 10);
+    assert.equal(h.manager.maxSessions, null);
+});
+
+test('a full configured helper/local budget still permits native RTSP URLs without another source', async t => {
+    const helper = helperFixture({ sourceCount: () => 5 });
+    const h = harness(t, { managerOptions: { helperClient: helper } });
+    h.settings.set('camera_stream_limit', { maxStreams: 5 });
+    const native = h.camera('NATIVE', 'BASE', { native: true, values: { rtspStreamUrl: 'rtsp://fixture-camera/live' } });
+    await h.manager.registerVideo(native);
+    assert.deepEqual(await h.videos[0].listener(), { url: 'rtsp://fixture-camera/live' });
+    assert.equal(h.manager.sourceCount(), 5); assert.equal(h.processes.length, 0);
+    await assert.rejects(h.manager.getSession(h.camera('LOCAL')), /stream limit \(5\)/);
 });
 
 test('helper cleanup failure cannot prevent local shutdown or unregistering native camera videos', async t => {

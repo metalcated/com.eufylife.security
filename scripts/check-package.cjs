@@ -36,6 +36,7 @@ async function main() {
                 'lib/helpers/camera-p2p-owned-session.helper.js',
                 'lib/helpers/camera-native-video-rsa.helper.js',
                 'lib/helpers/camera-helper-client.helper.js',
+                'lib/helpers/camera-stream-limit.helper.js',
                 'settings/index.html', 'settings/camera-wall.js', 'settings/camera-wall.css',
                 'node_modules/eufy-security-client/build/index.js', 'node_modules/homey-api/index.js']) {
                 assert(files.includes(required), `Missing runtime file: ${required}`);

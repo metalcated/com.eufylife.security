@@ -559,6 +559,110 @@ async function closedViewer(f, session, response) {
     assert.equal(f.helper.records.get(session.id)?.viewers.size, 0);
 }
 
+test('shared stream limits are authenticated, epoch-bound, and support a number or No limit', async t => {
+    const f = await fixture(t);
+    const health = await f.request('GET', '/v1/health');
+    assert.equal(health.json.capabilities.streamLimitSettings, true);
+    const body = maxStreams => ({ owner: OWNER, epoch: f.epoch, maxStreams });
+    assert.equal((await f.request('PUT', '/v1/limits', body(6), { headers: { Authorization: 'Bearer invalid' } })).status, 401);
+    assert.equal(f.helper.maxSessions, 4);
+    for (const value of [0, -1, 1.5, '6', false, {}, [], Number.MAX_SAFE_INTEGER + 1]) {
+        assert.equal((await f.request('PUT', '/v1/limits', body(value))).status, 400);
+    }
+    assert.equal((await f.request('PUT', '/v1/limits', { ...body(6), token: SECRET })).status, 400);
+    assert.equal((await f.request('PUT', '/v1/limits', { ...body(6), epoch: randomUUID() })).status, 409);
+    assert.equal(f.helper.maxSessions, 4);
+    assert.deepEqual((await f.request('PUT', '/v1/limits', body(6))).json, { maxStreams: 6 });
+    assert.equal(f.managers.at(-1).options.getStreamLimit(), 6);
+    assert.deepEqual((await f.request('PUT', '/v1/limits', body(null))).json, { maxStreams: null });
+    assert.equal(f.managers.at(-1).options.getStreamLimit(), null);
+    assert.equal((await f.request('PUT', '/v1/limits', body(Number.MAX_SAFE_INTEGER))).status, 200);
+    assert.equal(f.helper.maxSessions, Number.MAX_SAFE_INTEGER);
+});
+
+test('raising, lowering, and removing the limit preserves admitted sources and governs new requests', async t => {
+    const f = await fixture(t, { autoReady: false });
+    const setLimit = maxStreams => f.request('PUT', '/v1/limits', { owner: OWNER, epoch: f.epoch, maxStreams });
+    await setLimit(6);
+    const sessions = [];
+    for (const label of ['A', 'B', 'C', 'D', 'E', 'F']) sessions.push(await f.open(label));
+    assert.equal(f.helper.records.size, 6);
+    const extra = () => f.request('POST', '/v1/sessions', { owner: OWNER, epoch: f.epoch,
+        requestId: randomUUID(), deviceId: randomUUID(), metadata: metadata('G') });
+    assert.equal((await extra()).status, 429);
+    await setLimit(2);
+    assert.equal(f.helper.records.size, 6);
+    assert.equal(f.managers.at(-1).stops.length, 0);
+    assert.equal((await extra()).status, 429);
+    const first = f.helper.records.get(sessions[0].id);
+    const duplicate = await f.request('POST', '/v1/sessions', { owner: OWNER, epoch: f.epoch,
+        requestId: first.requestId, deviceId: first.deviceId, metadata: metadata('A') });
+    assert.equal(duplicate.status, 200);
+    assert.equal(duplicate.json.id, first.id);
+    await setLimit(null);
+    assert.equal((await extra()).status, 200);
+    assert.equal(f.helper.records.size, 7);
+});
+
+test('a repeated owner connection preserves its limit and a new epoch resets it for negotiation', async t => {
+    const f = await fixture(t);
+    await f.request('PUT', '/v1/limits', { owner: OWNER, epoch: f.epoch, maxStreams: null });
+    await f.open('A');
+    await f.connect();
+    assert.equal(f.helper.maxSessions, null);
+    assert.equal(f.helper.records.size, 1);
+    const oldEpoch = f.epoch;
+    f.epoch = randomUUID();
+    await f.connect();
+    assert.equal(f.helper.maxSessions, 4);
+    assert.equal(f.helper.records.size, 0);
+    assert.equal((await f.request('PUT', '/v1/limits', { owner: OWNER, epoch: oldEpoch, maxStreams: null })).status, 409);
+    assert.equal((await f.request('PUT', '/v1/limits', { owner: OWNER, epoch: f.epoch, maxStreams: 7 })).status, 200);
+    assert.equal(f.helper.maxSessions, 7);
+});
+
+test('No limit has no hidden active-request ceiling and mass closure retains all unexpired proof', async t => {
+    let now = 1000;
+    const f = await fixture(t, { now: () => now });
+    await f.request('PUT', '/v1/limits', { owner: OWNER, epoch: f.epoch, maxStreams: null });
+    const sessions = [];
+    for (let index = 0; index < 130; index++) {
+        const data = metadata(`CAM${index}`); data.rawDevice.device_channel = index;
+        sessions.push(await f.open(`CAM${index}`, { metadata: data }));
+    }
+    assert.equal(f.helper.records.size, 130);
+    assert.equal(f.helper.requests.size, 130);
+    now += 75000;
+    await f.helper.prune();
+    assert.equal(f.helper.records.size, 0);
+    assert.equal(f.managers.at(-1).sourceCount(), 0);
+    assert.equal(f.helper.idleRetired.size, 130);
+    for (const session of [sessions[0], sessions[129]]) {
+        assert.equal((await f.request('GET', `/v1/sessions/${session.id}/status`)).status, 410);
+    }
+    const next = () => f.request('POST', '/v1/sessions', { owner: OWNER, epoch: f.epoch,
+        requestId: randomUUID(), deviceId: randomUUID(), metadata: metadata('NEXT') });
+    assert.equal((await next()).status, 429, 'detached-request backpressure remains bounded after mass closure');
+    now += 120001; await f.helper.prune();
+    assert.equal(f.helper.idleRetired.size, 0);
+    assert.equal((await next()).status, 200);
+});
+
+test('a rejected request without a later cancel expires instead of permanently blocking admission', async t => {
+    let now = 1000;
+    const f = await fixture(t, { now: () => now, serverOptions: { maxRequests: 1, requestTtlMs: 100 } });
+    await f.request('PUT', '/v1/limits', { owner: OWNER, epoch: f.epoch, maxStreams: 1 });
+    const first = await f.open('A');
+    const extra = () => f.request('POST', '/v1/sessions', { owner: OWNER, epoch: f.epoch,
+        requestId: randomUUID(), deviceId: randomUUID(), metadata: metadata('B') });
+    assert.equal((await extra()).status, 429);
+    await f.request('PUT', '/v1/limits', { owner: OWNER, epoch: f.epoch, maxStreams: null });
+    assert.equal((await extra()).status, 429, 'the abandoned request initially consumes the detached-request allowance');
+    now += 101; await f.helper.prune();
+    assert.ok(f.helper.records.has(first.id), 'request cleanup must not expire an attached active request');
+    assert.equal((await extra()).status, 200);
+});
+
 test('four closed viewers retire their leases and allow a fifth camera without renewing the old sources', async t => {
     let now = 1000;
     const f = await fixture(t, { now: () => now });

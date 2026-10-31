@@ -12,7 +12,7 @@ const net = require('node:net');
 
 const OWNER = 'com.eufylife.security';
 const SDK = '4.2.6';
-const VERSION = '0.1.2';
+const VERSION = '0.2.0';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const IDENTITY = /^[A-Za-z0-9_-]{1,128}$/;
 const BODY_LIMIT = 512 * 1024;
@@ -35,7 +35,7 @@ const DIAGNOSTICS = Object.freeze({
     'lease.replaced': 'A camera lease was revoked by a newer app connection.',
     'lease.expired': 'A camera lease expired without renewal.',
     'lease.idle': 'An unused camera lease was retired after its source resources closed.',
-    'capacity.sources': 'The four-source limit prevented another camera source.',
+    'capacity.sources': 'The configured stream limit prevented another camera source.',
     'capacity.requests': 'The bounded camera-request registry is full.',
     'capacity.rpc': 'The pending camera API request limit was reached.',
     'capacity.rpc_rate': 'The camera API request rate limit was reached.',
@@ -122,9 +122,12 @@ class HelperServer {
         this.observedSources = new WeakSet();
         this.startTimeoutMs = options.startTimeoutMs ?? 25000; this.rpcTimeoutMs = options.rpcTimeoutMs ?? 10000;
         this.idleGraceMs = options.idleGraceMs ?? 5000; this.firstViewerMs = options.firstViewerMs ?? 75000;
-        this.closeTimeoutMs = options.closeTimeoutMs ?? 5000; this.maxSessions = Math.min(options.maxSessions || 4, 4);
+        this.closeTimeoutMs = options.closeTimeoutMs ?? 5000;
+        this.defaultMaxSessions = options.maxSessions === undefined ? 4 : options.maxSessions;
+        if (this.defaultMaxSessions !== null && (!Number.isSafeInteger(this.defaultMaxSessions) || this.defaultMaxSessions < 1)) throw new Error('Invalid camera stream limit.');
+        this.maxSessions = this.defaultMaxSessions;
         this.requestTtlMs = options.requestTtlMs ?? 120000; this.maxRequests = options.maxRequests || 128;
-        for (const [value, maximum] of [[this.maxSessions, 4], [this.maxRequests, 128], [this.leaseMs, 75000],
+        for (const [value, maximum] of [[this.maxRequests, 128], [this.leaseMs, 75000],
             [this.startTimeoutMs, 25000], [this.rpcTimeoutMs, 10000], [this.closeTimeoutMs, 5000], [this.requestTtlMs, 120000],
             [this.idleGraceMs, 5000], [this.firstViewerMs, 75000]]) {
             if (!Number.isInteger(value) || value < 1 || value > maximum) throw new Error('Invalid camera helper limits.');
@@ -140,7 +143,7 @@ class HelperServer {
         homey.platformVersion = 2; homey.settings = { get: name => name === 'camera_isolated_p2p_devices' ? true : undefined };
         this.globalClient = new EventEmitter(); this.globalClient.isConnected = () => true;
         homey.app = { eufyClient: this.globalClient, log() {}, warn() {}, error() {} };
-        const managerOptions = { userdata: this.mediaDir, maxSessions: this.maxSessions, startTimeoutMs: this.startTimeoutMs,
+        const managerOptions = { userdata: this.mediaDir, getStreamLimit: () => this.maxSessions, startTimeoutMs: this.startTimeoutMs,
             resolveBinary: async () => options.ffmpeg || '/usr/bin/ffmpeg',
             createP2PSession: params => {
                 const record = params.homeyDevice.helperRecord;
@@ -281,7 +284,7 @@ class HelperServer {
     }
 
     trimRequests() {
-        for (const [id, entry] of this.requests) if (entry.cancelled && entry.expiresAt <= this.now() && !entry.record) {
+        for (const [id, entry] of this.requests) if (entry.expiresAt <= this.now() && !entry.record) {
             this.requests.delete(id);
             if (entry.idleRetiredId && this.idleRetired.get(entry.idleRetiredId) === entry) this.idleRetired.delete(entry.idleRetiredId);
         }
@@ -339,8 +342,11 @@ class HelperServer {
         let entry = this.requests.get(requestId);
         if (entry && (entry.owner !== binding.owner || entry.epoch !== binding.epoch || entry.deviceId !== binding.deviceId)) throw new HTTPError(409, 'The camera request belongs to another session.');
         if (!entry) {
-            if (this.requests.size >= this.maxRequests) { this.diagnostic('capacity.requests'); throw new HTTPError(429, 'Too many camera requests. Retry later.'); }
-            entry = { owner: binding.owner, epoch: binding.epoch, deviceId: binding.deviceId, requestId };
+            if ([...this.requests.values()].filter(entry => !entry.record).length >= this.maxRequests) {
+                this.diagnostic('capacity.requests'); throw new HTTPError(429, 'Too many camera requests. Retry later.');
+            }
+            entry = { owner: binding.owner, epoch: binding.epoch, deviceId: binding.deviceId, requestId,
+                expiresAt: this.now() + this.requestTtlMs };
             this.requests.set(requestId, entry);
         }
         return entry;
@@ -348,11 +354,22 @@ class HelperServer {
 
     async connect(body) {
         if (!keys(body, ['owner', 'epoch', 'protocol', 'sdk']) || body.protocol !== 1 || body.sdk !== SDK) throw new HTTPError(409, 'The camera helper protocol is incompatible.');
-        this.binding(body); this.owners.set(body.owner, body.epoch);
+        this.binding(body);
+        if (this.owners.get(body.owner) !== body.epoch) this.maxSessions = this.defaultMaxSessions;
+        this.owners.set(body.owner, body.epoch);
         const stopped = await Promise.allSettled([...this.records.values()].filter(record => record.owner === body.owner && record.epoch !== body.epoch)
             .map(record => { this.diagnostic('lease.replaced'); return this.closeRecord(record); }));
         if (stopped.some(result => result.status === 'rejected')) throw fixedError();
         return { protocol: 1, version: VERSION, sdk: SDK, instance: this.instance, owner: body.owner, epoch: body.epoch };
+    }
+
+    setStreamLimit(body) {
+        if (!keys(body, ['owner', 'epoch', 'maxStreams']) || body.maxStreams !== null
+            && (!Number.isSafeInteger(body.maxStreams) || body.maxStreams < 1)) throw new HTTPError(400, 'Invalid camera stream limit.');
+        this.binding(body);
+        if (this.owners.get(body.owner) !== body.epoch) throw new HTTPError(409, 'Connect the camera owner first.');
+        this.maxSessions = body.maxStreams;
+        return { maxStreams: this.maxSessions };
     }
 
     makeDevice(record) {
@@ -381,7 +398,7 @@ class HelperServer {
         if (entry.cancelled) throw new HTTPError(409, 'The camera request was cancelled.');
         if (entry.record) return { id: entry.record.id, mediaUrl: entry.record.mediaUrl };
         if (this.cameras.has(cameraKey)) throw new HTTPError(409, 'This camera already has an active request.');
-        if (this.records.size >= this.maxSessions) { this.diagnostic('capacity.sources'); throw new HTTPError(429, 'There are already four active camera sessions.'); }
+        if (this.maxSessions !== null && this.records.size >= this.maxSessions) { this.diagnostic('capacity.sources'); throw new HTTPError(429, 'The configured camera stream limit has been reached. Stop a stream or change the limit.'); }
         if ([...this.records.values()].some(record => record.serial === metadata.rawDevice.device_sn)) throw new HTTPError(409, 'This camera already has an active request.');
         const cap = crypto.createHmac('sha256', Buffer.from(this.secret, 'utf8')).update(`${body.owner}\0${body.deviceId}`).digest('hex').slice(0, 48);
         const record = { id: crypto.randomUUID(), requestId: body.requestId, owner: body.owner, epoch: body.epoch, deviceId: body.deviceId,
@@ -499,6 +516,7 @@ class HelperServer {
             if (this.cameras.get(record.cameraKey) === record) this.cameras.delete(record.cameraKey);
             if (this.capabilities.get(record.cap) === record) this.capabilities.delete(record.cap);
             if (entry?.record === record) entry.record = null;
+            record.metadata = null;
             if (record.idleRetiring && entry) {
                 entry.expiresAt = this.now() + this.requestTtlMs;
                 entry.idleRetiredId = record.id; entry.idleRetiredCap = record.cap;
@@ -555,12 +573,16 @@ class HelperServer {
         }
         if (!this.authenticated(request)) throw new HTTPError(401, 'Camera helper authentication required.');
         if (this.closed) throw new HTTPError(503, 'The camera helper is shutting down.');
-        if (request.method === 'GET' && route === '/v1/health') return this.json(response, 200, { protocol: 1, version: VERSION, sdk: SDK, instance: this.instance });
+        if (request.method === 'GET' && route === '/v1/health') return this.json(response, 200, { protocol: 1, version: VERSION, sdk: SDK, instance: this.instance,
+            capabilities: { streamLimitSettings: true } });
         if (request.method === 'POST' && route === '/v1/connect') {
             const body = await this.body(request); return this.json(response, 200, await this.mutate(() => this.connect(body)));
         }
         if (request.method === 'POST' && route === '/v1/sessions') {
             const body = await this.body(request); return this.json(response, 200, await this.mutate(() => this.createSession(body)));
+        }
+        if (request.method === 'PUT' && route === '/v1/limits') {
+            const body = await this.body(request); return this.json(response, 200, await this.mutate(() => this.setStreamLimit(body)));
         }
         const cancellation = /^\/v1\/requests\/([a-f0-9-]{36})$/i.exec(route);
         if (cancellation && request.method === 'DELETE') {

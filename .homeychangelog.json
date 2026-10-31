@@ -1,4 +1,7 @@
 {
+  "3.46.0": {
+    "en": "Choose a shared camera stream limit or No limit in Camera settings. Saved settings apply across Homey web, iOS and Android and survive app and media-helper restarts."
+  },
   "3.45.0": {
     "en": "Move selected P2P camera video and snapshots to an authenticated local media helper while retaining native Homey cameras, existing controls, and persistent update-compatible connection settings."
   },

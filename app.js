@@ -13,6 +13,7 @@ const flowTriggers = require('./lib/flow/triggers.js');
 
 const eufyEventsHelper = require('./lib/helpers/eufy-events.helper');
 const FfmpegManager = require('./lib/helpers/camera-media.helper');
+const CameraStreamLimit = require('./lib/helpers/camera-stream-limit.helper');
 
 const { sleep, randomNumber, normalizeRemoteLines, fetchRemoteText } = require('./lib/utils');
 
@@ -133,6 +134,39 @@ class App extends Homey.App {
 
     getSmartDisplayStatus() {
         return this.displayDiscovery.getStatus(this.eufyClient);
+    }
+
+    cameraSettingsResponse(settings, applied) {
+        return { maxStreams: settings.maxStreams, defaultMaxStreams: CameraStreamLimit.DEFAULT_MAX_STREAMS, saved: settings.saved,
+            applyStatus: applied ? 'applied' : 'pending',
+            message: applied ? 'The stream limit is ready. Existing streams will continue.'
+                : 'The stream limit is saved. It will apply when the camera media helper reconnects or is updated.' };
+    }
+
+    getCameraSettings() {
+        const helper = this.FfmpegManager?.helperClient;
+        let applied = !helper;
+        try { if (helper) applied = helper.getStreamLimitStatus?.().applied === true; }
+        catch { applied = false; }
+        return this.cameraSettingsResponse(CameraStreamLimit.getSettings(this.homey), applied);
+    }
+
+    setCameraSettings(body) {
+        const value = CameraStreamLimit.validate(body);
+        const update = (this.cameraSettingsQueue || Promise.resolve()).then(async () => {
+            // Keep this key separate from account settings and their logging.
+            try { await this.homey.settings.set(CameraStreamLimit.SETTING_KEY, value); }
+            catch { throw Object.assign(new Error('The camera stream limit could not be saved. Please retry.'),
+                { status: 503, statusCode: 503, cameraSettingsPublic: true }); }
+            let applied = !this.FfmpegManager?.helperClient;
+            try {
+                if (this.FfmpegManager?.helperClient) applied = (await this.FfmpegManager.helperClient.syncStreamLimit()).applied === true;
+            } catch { applied = false; }
+            return this.cameraSettingsResponse({ ...value, saved: true }, applied);
+        });
+        // A failed write must not poison later updates from another settings view.
+        this.cameraSettingsQueue = update.catch(() => {});
+        return update;
     }
 
     // -------------------- SETTINGS ----------------------

@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const CameraWall = require('../lib/helpers/camera-wall.helper');
+const { getStreamLimit, SETTING_KEY } = require('../lib/helpers/camera-stream-limit.helper');
 
 const CREDENTIALS_KEY = 'camera_wall_credentials';
 const API_KEY = 'dedicated-read-only-test-key';
@@ -51,6 +52,12 @@ function harness(t, options = {}) {
         now: () => time,
         createLocalAPI: async args => { calls.push(['client', args]); if (options.createLocalAPI) return options.createLocalAPI(args); return api; }
     });
+    let sourceLimitOverride;
+    Object.defineProperty(homey.app.FfmpegManager, 'maxSessions', {
+        configurable: true,
+        get() { return sourceLimitOverride === undefined ? getStreamLimit(homey) : sourceLimitOverride; },
+        set(value) { sourceLimitOverride = value; }
+    });
     t.after(() => manager.dispose());
     function camera(index = 1, options = {}) {
         const device = {
@@ -82,8 +89,8 @@ test('status exposes camera health without credentials, source URLs, serials, or
     h.camera(2, { privacy: true });
     const status = h.manager.status();
     assert.deepEqual(status, { configured: true, maxViews: 4, cameras: [
-        { id: 'DEVICE_1', name: 'Camera 1', available: true, videoRegistered: true },
-        { id: 'DEVICE_2', name: 'Camera 2', available: false, videoRegistered: true }
+        { id: 'DEVICE_1', name: 'Camera 1', available: true, videoRegistered: true, usesStreamLimit: true },
+        { id: 'DEVICE_2', name: 'Camera 2', available: false, videoRegistered: true, usesStreamLimit: true }
     ] });
     const text = JSON.stringify(status);
     for (const privateValue of [API_KEY, SECRET, 'SERIAL_', '00000000-0000-4000']) assert.equal(text.includes(privateValue), false);
@@ -202,12 +209,100 @@ test('the four-view limit also counts concurrent pending negotiations', async t 
     const h = harness(t, { videoOffer: () => pending.promise });
     for (let index = 1; index <= 5; index++) h.camera(index);
     const offers = [1, 2, 3, 4].map(index => h.manager.offer(`DEVICE_${index}`, OFFER));
-    await assert.rejects(h.manager.offer('DEVICE_5', OFFER), /four camera views/);
+    await assert.rejects(h.manager.offer('DEVICE_5', OFFER), /camera view limit/);
     assert.equal(h.manager.handles.size, 4);
     pending.resolve({ answerSdp: ANSWER, streamId: SECRET });
     await Promise.all(offers);
     assert.equal(h.calls.filter(call => call[0] === 'client').length, 1);
     assert.equal(h.calls.filter(call => call[0] === 'offer').length, 4);
+});
+
+test('the shared numeric limit admits six pending views and rejects a seventh', async t => {
+    const pending = deferred();
+    const h = harness(t, { videoOffer: () => pending.promise });
+    h.settings.set(SETTING_KEY, { maxStreams: 6 });
+    for (let index = 1; index <= 7; index++) h.camera(index);
+    assert.equal(h.manager.status().maxViews, 6);
+    const offers = [1, 2, 3, 4, 5, 6].map(index => h.manager.offer(`DEVICE_${index}`, OFFER));
+    await assert.rejects(h.manager.offer('DEVICE_7', OFFER), /camera view limit/);
+    assert.equal(h.manager.handles.size, 6);
+    pending.resolve({ answerSdp: ANSWER, streamId: SECRET });
+    await Promise.all(offers);
+});
+
+test('No limit survives wall recreation and permits more than four views', async t => {
+    const h = harness(t);
+    h.settings.set(SETTING_KEY, { maxStreams: null });
+    const recreated = new CameraWall(h.homey, { createLocalAPI: async () => h.api });
+    t.after(() => recreated.dispose());
+    assert.equal(recreated.status().maxViews, null);
+    for (let index = 1; index <= 12; index++) {
+        h.camera(index);
+        await recreated.offer(`DEVICE_${index}`, OFFER);
+    }
+    assert.equal(recreated.handles.size, 12);
+});
+
+test('lowering the shared limit preserves active views and allows sharing an existing camera', async t => {
+    const h = harness(t);
+    h.settings.set(SETTING_KEY, { maxStreams: 6 });
+    for (let index = 1; index <= 7; index++) h.camera(index);
+    const views = await Promise.all([1, 2, 3, 4, 5, 6].map(index => h.manager.offer(`DEVICE_${index}`, OFFER)));
+    h.settings.set(SETTING_KEY, { maxStreams: 2 });
+    assert.equal(h.manager.status().maxViews, 2);
+    assert.equal(h.manager.handles.size, 6);
+    await h.manager.keepAlive('DEVICE_1', views[0].handle);
+    await assert.rejects(h.manager.offer('DEVICE_7', OFFER), /camera view limit/);
+    const shared = await h.manager.offer('DEVICE_1', OFFER);
+    assert.match(shared.handle, /^[0-9a-f]{48}$/);
+    assert.equal(h.manager.handles.size, 7);
+});
+
+test('an existing helper source can be viewed at capacity without using a legacy HomeBase session', async t => {
+    const h = harness(t);
+    const camera = h.camera();
+    const media = h.homey.app.FfmpegManager;
+    media.sourceCount = () => 4;
+    media.stationOwners.set(camera.EufyDevice.getStationSerial(), SECRET);
+    media.helperClient = { enabled: () => true, hasSource: device => device === camera };
+    let refreshes = 0;
+    media.refreshHelperStatus = async () => { refreshes++; };
+    await h.manager.offer(camera.getId(), OFFER);
+    assert.equal(refreshes, 2);
+    assert.equal(media.stationOwners.get(camera.EufyDevice.getStationSerial()), SECRET);
+});
+
+test('helper capacity reconciliation rechecks camera privacy before requesting video', async t => {
+    const h = harness(t);
+    const camera = h.camera();
+    const media = h.homey.app.FfmpegManager;
+    media.helperClient = { enabled: () => true, hasSource: () => true };
+    media.refreshHelperStatus = async () => { camera.privacy = true; };
+    await assert.rejects(h.manager.offer(camera.getId(), OFFER), /privacy mode/);
+    assert.equal(h.manager.handles.size, 0);
+    assert.equal(h.calls.filter(([name]) => name === 'offer').length, 0);
+});
+
+test('a cancelled or expired offer cannot dispatch after its second helper-capacity refresh', async t => {
+    for (const cancel of ['invalidate', 'dispose', 'expire']) {
+        const gate = deferred();
+        const h = harness(t);
+        const camera = h.camera();
+        const media = h.homey.app.FfmpegManager;
+        media.helperClient = { enabled: () => true, hasSource: () => true };
+        let refreshes = 0;
+        media.refreshHelperStatus = () => ++refreshes === 2 ? gate.promise : Promise.resolve();
+        const offer = h.manager.offer(camera.getId(), OFFER);
+        offer.catch(() => {});
+        for (let index = 0; index < 20 && refreshes < 2; index++) await new Promise(setImmediate);
+        assert.equal(refreshes, 2);
+        if (cancel === 'expire') h.advance(75001);
+        else h.manager[cancel]();
+        gate.resolve();
+        await assert.rejects(offer, safeError);
+        assert.equal(h.calls.filter(([name]) => name === 'offer').length, 0);
+        assert.equal(h.manager.handles.size, 0);
+    }
 });
 
 test('a busy P2P HomeBase is explained before requesting video without changing source ownership', async t => {
@@ -303,6 +398,60 @@ test('working native RTSP bypasses P2P station ownership and source capacity', a
     assert.match(view.handle, /^[0-9a-f]{48}$/);
     assert.equal(h.calls.filter(call => call[0] === 'offer').length, 1);
     assert.equal(media.stationOwners.get(camera.EufyDevice.getStationSerial()), SECRET);
+});
+
+test('more than four native RTSP negotiations bypass the finite wall relay budget', async t => {
+    const pending = deferred();
+    const h = harness(t, { videoOffer: () => pending.promise });
+    const media = h.homey.app.FfmpegManager;
+    media.sourceCount = () => 4;
+    for (let index = 1; index <= 6; index++) h.camera(index).EufyDevice.native = true;
+    const offers = [1, 2, 3, 4, 5, 6].map(index => h.manager.offer(`DEVICE_${index}`, OFFER));
+    for (let turn = 0; turn < 12; turn++) await Promise.resolve();
+    assert.equal(h.manager.handles.size, 6);
+    assert.ok(h.manager.status().cameras.every(camera => camera.usesStreamLimit === false));
+    pending.resolve({ answerSdp: ANSWER, streamId: SECRET });
+    await Promise.all(offers);
+    assert.equal(h.calls.filter(([name]) => name === 'offer').length, 6);
+});
+
+test('native RTSP views do not consume mixed-wall P2P capacity and same-camera P2P views still share it', async t => {
+    const h = harness(t);
+    h.settings.set(SETTING_KEY, { maxStreams: 2 });
+    for (let index = 1; index <= 5; index++) h.camera(index).EufyDevice.native = true;
+    for (let index = 6; index <= 8; index++) h.camera(index);
+    await Promise.all([1, 2, 3, 4, 5].map(index => h.manager.offer(`DEVICE_${index}`, OFFER)));
+    await h.manager.offer('DEVICE_6', OFFER); await h.manager.offer('DEVICE_7', OFFER);
+    await assert.rejects(h.manager.offer('DEVICE_8', OFFER), /camera view limit/);
+    await h.manager.offer('DEVICE_6', OFFER);
+    assert.equal(h.manager.handles.size, 8);
+    assert.equal(h.manager.status().cameras.find(camera => camera.id === 'DEVICE_6').usesStreamLimit, true);
+
+    const native = h.homey.app.deviceList[0];
+    native.privacy = true;
+    await assert.rejects(h.manager.offer(native.getId(), OFFER), /privacy mode/);
+    assert.equal(h.manager.handles.size, 8, 'privacy checks must not alter unrelated leases');
+});
+
+test('native classification tracks current fallback and unresolved old registrations count conservatively', async t => {
+    const h = harness(t);
+    h.settings.set(SETTING_KEY, { maxStreams: 1 });
+    const native = h.camera(); native.EufyDevice.native = true;
+    h.camera(2);
+    const view = await h.manager.offer(native.getId(), OFFER);
+    assert.equal(h.manager.status().cameras[0].usesStreamLimit, false);
+    native.EufyDevice.native = false;
+    assert.equal(h.manager.status().cameras[0].usesStreamLimit, true);
+    await assert.rejects(h.manager.offer('DEVICE_2', OFFER), /camera view limit/);
+
+    native.EufyDevice.native = true;
+    h.homey.app.FfmpegManager.videos.delete(native.EufyDevice.getSerial());
+    await assert.rejects(h.manager.offer('DEVICE_2', OFFER), /camera view limit/);
+    native.EufyDevice.getSerial = () => { throw Error(SECRET); };
+    await assert.rejects(h.manager.offer('DEVICE_2', OFFER), error => safeError(error) && /camera view limit/.test(error.message));
+    h.advance(75001);
+    await h.manager.offer('DEVICE_2', OFFER);
+    assert.equal(h.manager.handles.has(view.handle), false);
 });
 
 test('a HomeBase becoming busy during API setup prevents stale negotiation', async t => {

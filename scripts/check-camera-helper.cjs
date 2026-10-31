@@ -113,6 +113,7 @@ async function createHelper(port = 0) {
         ffmpeg: binary, startTimeoutMs: 15000,
         createP2PSession: params => {
             if (sourceMode === 'media') return syntheticSource(params);
+            if (sourceMode === 'capacity') return { async start() {}, async close() { return { stopConfirmed: true }; } };
             const adapter = new CameraP2PSession({ ...params, WorkerClass: ObservedWorker,
                 startupTimeoutMs: 15000, shutdownTimeoutMs: 100, terminationTimeoutMs: 3000 });
             adapters.push(adapter); return adapter;
@@ -324,6 +325,38 @@ async function idleReleaseAndExplicitReopen() {
     assert.equal(helper.records.size, 0); assert.equal(client.sourceCount(), 0);
 }
 
+async function configuredSourceCapacity() {
+    // Exercise production server/manager reservations beyond four without
+    // launching extra SDK threads or encoders just to count pending sources.
+    sourceMode = 'capacity';
+    const connection = client.connection();
+    const requests = Array.from('QRSTUV', label => {
+        const hd = camera(label);
+        const broker = new CameraP2PSession({ client: accountClient, homeyDevice: hd });
+        return { owner: 'com.eufylife.security', epoch: client.epoch, requestId: randomUUID(),
+            deviceId: hd.getId(), metadata: broker.workerData };
+    });
+    const create = body => client.json(connection, '/v1/sessions', { method: 'POST', body });
+    try {
+        settings.set('camera_stream_limit', { maxStreams: 5 }); await client.syncStreamLimit();
+        const leases = await Promise.all(requests.slice(0, 5).map(create));
+        assert.equal(helper.records.size, 5); assert.equal(helper.manager.sourceCount(), 5);
+        await assert.rejects(create(requests[5]), error => error.helperStatus === 429);
+        settings.set('camera_stream_limit', { maxStreams: 2 }); await client.syncStreamLimit();
+        assert.equal(helper.records.size, 5, 'Lowering a limit stopped an established or pending source.');
+        assert.equal((await create(requests[0])).id, leases[0].id, 'An existing camera request lost source sharing.');
+        await assert.rejects(create(requests[5]), error => error.helperStatus === 429);
+        settings.set('camera_stream_limit', { maxStreams: null }); await client.syncStreamLimit();
+        await create(requests[5]);
+        assert.equal(helper.records.size, 6); assert.equal(helper.manager.sourceCount(), 6);
+    } finally {
+        await Promise.all(requests.map(body => client.json(connection, `/v1/requests/${body.requestId}`, { method: 'DELETE',
+            body: { owner: body.owner, epoch: body.epoch, deviceId: body.deviceId } })));
+        settings.delete('camera_stream_limit'); await client.syncStreamLimit(); sourceMode = 'media';
+    }
+    assert.equal(helper.records.size, 0); assert.equal(helper.manager.sourceCount(), 0);
+}
+
 async function main() {
     workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'homey-helper-smoke-'));
     const resolver = new FfmpegResolver(homey);
@@ -338,12 +371,13 @@ async function main() {
     const restored = await mediaAndUpdates(started.port);
     await incompatibleUpgradeRollback(restored, started.origin);
     await idleReleaseAndExplicitReopen();
+    await configuredSourceCapacity();
     await client.dispose();
     assert.equal(helper.records.size, 0);
     await helper.close();
     assert.ok(workers.every(worker => worker.threadId === -1));
     assert.equal(sources.size, 0);
-    console.log('Camera helper integration verified: actual Homey client/protocol, real SDK workers and owned UDP cleanup, cipher RPC/fallback, late privacy cancellation, isolated same-HomeBase feeds, real H264/HEVC HTTP decoding and snapshots, app-client recreation, persistent-link helper restart recovery, incompatible-upgrade rollback, HTTP-viewer idle retirement without auto-recreation, explicit same-camera reopening, and final resource cleanup.');
+    console.log('Camera helper integration verified: actual Homey client/protocol, real SDK workers and owned UDP cleanup, cipher RPC/fallback, late privacy cancellation, isolated same-HomeBase feeds, real H264/HEVC HTTP decoding and snapshots, app-client recreation, persistent-link helper restart recovery, incompatible-upgrade rollback, HTTP-viewer idle retirement without auto-recreation, explicit same-camera reopening, configured five-source admission, lowering without stopping existing feeds, No limit admission, and final resource cleanup.');
 }
 
 async function cleanup() {

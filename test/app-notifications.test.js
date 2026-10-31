@@ -22,6 +22,7 @@ function harness(options = {}) {
         './lib/flow/triggers.js': {},
         './lib/helpers/eufy-events.helper': unusedHelper,
         './lib/helpers/camera-media.helper': unusedHelper,
+        './lib/helpers/camera-stream-limit.helper': require('../lib/helpers/camera-stream-limit.helper'),
         './lib/helpers/eufy-logger.helper': {},
         './lib/display-discovery': { DisplayDiscovery: unusedHelper },
         './lib/utils': {
